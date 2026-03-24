@@ -1,0 +1,15 @@
+{
+  "factor_name": "turnover_rate",
+  "description": "Processed turnover_rate factor (Winsorized, Neutralized, Standardized)",
+  "processing_steps": [
+    "Drop missing values (fill_na=False)",
+    "3MAD Winsorization (Factor & Log Market Value)",
+    "Neutralization (Industry + Log Market Value)",
+    "Z-Score Standardization"
+  ],
+  "columns": [
+    "symbol",
+    "turnover_rate"
+  ],
+  "format": "parquet"
+}
