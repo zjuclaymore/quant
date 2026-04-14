@@ -146,16 +146,14 @@ class BacktestCoreMixin:
                 - 'auto': 根据 G1 与 G10 的全期累计净值自动判定。
                 - 1: 判定因子值为正相关 (因子值越大，未来收益越高)。
                 - -1: 判定因子值为负相关 (因子值越小，未来收益越高)。
-            benchmark_symbol (str, 默认 '000905.SH'): 
-                基准指数代码。脚本从 `index_daily_dir` 寻找对应 pickle 文件计算超额收益。
-            group_size (int, 默认 0): 
-                分组策略。
-                - 0: 采用 10 分组 (Deciles) 均分。
-                - >0: 每组固定持有 `group_size` 个股票（通常用于高频、小盘或特定头寸测试）。
+            group_size (int, 固定为 0): 
+                分组策略已硬编码为十分位均分，不支持外部配置。
             top_n_per_group (int, 默认 0):
                 分组后每组最多保留的样本数量。
                 - 0: 不截断，保留每组全部样本。
                 - >0: 在每个 year_month/group 内按因子值从高到低取前 N 只股票参与回测。
+            rebalance_month_end_close (bool, 固定为 True):
+                固定使用后复权月末收盘价进行买卖撮合，不支持外部配置。
 
         返回:
             None: 结果将持久化至 `self.out_dir`，通过日志、HTML 报告和 CSV 文件呈现。

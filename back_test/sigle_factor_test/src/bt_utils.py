@@ -714,6 +714,7 @@ def compute_backtest_kpis(
                         "单调性Newey-West检验失败: %s: %s", type(e).__name__, e
                     )
                     mono_t_nw, mono_p_nw = mono_t_ols, mono_p_ols
+    # 月度胜率：基准已移除， bench_return=0，因此等价于「正收益月份比例」。
     best_wins = (best_df["actual_ret"] > best_df["bench_return"]).sum()
     win_rate = best_wins / len(best_df) if len(best_df) > 0 else 0
     calmar = best_ret_ann / abs(max_drawdown) if max_drawdown != 0 else np.nan

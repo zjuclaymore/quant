@@ -65,10 +65,8 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
                 回测报告输出的主目录。若不存在则自动递归创建。
             st_df (pd.DataFrame, 可选): 
                 ST 状态区间记录。用于在 `_get_trade_mask` 阶段进行标的剔除。
-            ind_df (pd.DataFrame, 可选): 
-                兼容保留参数。当前回测侧不再执行行业中性化，行业暴露处理应在因子预处理阶段完成。
-            index_daily_dir (str, 可选): 
-                基准成分股与收盘价的 pickle 目录。用于计算超额收益及 IC 参照系。
+            ind_df (pd.DataFrame, 必填): 
+                申万行业分类数据，用于因子行业中性化。不允许为空。
             delay_days (int, 默认 0): 
                 交易执行延迟。0 代表信号产生当日即确定次日买入；>0 用于模拟信号计算耗时导致的延迟开仓。
 
