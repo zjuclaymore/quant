@@ -19,6 +19,8 @@
        中性化后的因子即为残差项 ε，其代表了剔除市值和行业暴露后的纯净因子收益贡献。
 """
 
+import os
+
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr, pearsonr
@@ -102,10 +104,14 @@ class BacktestCoreMixin:
         start_month="2000-01",
         end_month="2025-12",
         mv_df: pd.DataFrame = None,
-        commission=0.0015,
+        commission=0,
         direction="auto",
         benchmark_symbol="000905.SH",
         group_size: int = 0,
+        top_n_per_group: int = 0,
+        enable_neutralization: bool = True,
+        mad_clip_only: bool = False,
+        rebalance_month_end_close: bool = False,
     ):
         """
         执行单因子回测主执行器 (The Main Backtest Runner)
@@ -147,6 +153,10 @@ class BacktestCoreMixin:
                 分组策略。
                 - 0: 采用 10 分组 (Deciles) 均分。
                 - >0: 每组固定持有 `group_size` 个股票（通常用于高频、小盘或特定头寸测试）。
+            top_n_per_group (int, 默认 0):
+                分组后每组最多保留的样本数量。
+                - 0: 不截断，保留每组全部样本。
+                - >0: 在每个 year_month/group 内按因子值从高到低取前 N 只股票参与回测。
 
         返回:
             None: 结果将持久化至 `self.out_dir`，通过日志、HTML 报告和 CSV 文件呈现。
@@ -177,29 +187,41 @@ class BacktestCoreMixin:
         if has_industry: keep_cols.append("industry")
         df1 = df1[keep_cols]
 
-        # ============ 3. MAD + Z-score + 中性化 ============
+        # ============ 3. 预处理(3MAD/标准化/中性化) ============
         try:
-            df1[factor_name] = df1.groupby("year_month")[factor_name].transform(
-                lambda x: cross_section_mad_normalize(x, 3.0)
-            )
-            self.logger.info("已执行截面 MAD去极值与 Z-Score 标准化")
+            if mad_clip_only:
+                df1[factor_name] = df1.groupby("year_month")[factor_name].transform(
+                    lambda x: self._mad_clip_only(x, 3.0)
+                )
+                df1[factor_name] = df1.groupby("year_month")[factor_name].transform(
+                    lambda x: self._standardize_cross_section(x)
+                )
+                self.logger.info("已执行截面 3-MAD 去极值截断 + Z-Score 标准化")
+            else:
+                df1[factor_name] = df1.groupby("year_month")[factor_name].transform(
+                    lambda x: cross_section_mad_normalize(x, 3.0)
+                )
+                self.logger.info("已执行截面 MAD去极值与 Z-Score 标准化")
 
-            ind_col = "industry" if has_industry else None
-            neu_result = neutralize_factor(
-                df1,
-                factor_name,
-                "lncap",
-                ind_col=ind_col,
-                logger=self.logger,
-            )
-            df1[f"{factor_name}_neu"] = neu_result[0] if isinstance(neu_result, tuple) else neu_result
-            ind_msg = "包含行业维度" if has_industry else "仅含市值维度"
-            self.logger.info(f"已完成因子中性化 ({ind_msg})")
+            if enable_neutralization:
+                ind_col = "industry" if has_industry else None
+                neu_result = neutralize_factor(
+                    df1,
+                    factor_name,
+                    "lncap",
+                    ind_col=ind_col,
+                    logger=self.logger,
+                )
+                df1[f"{factor_name}_neu"] = neu_result[0] if isinstance(neu_result, tuple) else neu_result
+                ind_msg = "包含行业维度" if has_industry else "仅含市值维度"
+                self.logger.info(f"已完成因子中性化 ({ind_msg})")
+            else:
+                self.logger.info("已禁用因子中性化，本次回测直接使用预处理后原始因子")
         except Exception as e:
             self.logger.error(f"标准化与中性化过程中发生错误: {e}", exc_info=True)
             raise
 
-        target_factor = f"{factor_name}_neu"
+        target_factor = f"{factor_name}_neu" if enable_neutralization else factor_name
 
         # ============ 3.5 股票池提前筛查 (避免分组污染) ============
         cal = self.df_calendar[
@@ -207,37 +229,81 @@ class BacktestCoreMixin:
             & (self.df_calendar["year_month"] <= end_month)
         ].copy()
 
+        df1_all = df1.copy()
+
         # ============ 3.5 收集因子覆盖度信息 ============
-        # 覆盖度同时保留「全样本」与「交易池」两种口径，便于报告页对比。
-        def _build_coverage_records(frame):
+        # 覆盖度改为直接使用每期股票池追踪计数，避免用行情快照反推分母。
+        def _build_coverage_records(frame, denom_col):
+            def _norm_ym(v):
+                try:
+                    return pd.Period(str(v), freq="M").strftime("%Y-%m")
+                except Exception:
+                    return str(v)
+
+            trace_df = getattr(self, "stock_pool_trace_df", None)
+            trace_lookup = None
+            if trace_df is not None and not trace_df.empty and "year_month" in trace_df.columns:
+                trace_lookup = trace_df.copy()
+                trace_lookup["year_month"] = trace_lookup["year_month"].map(_norm_ym)
+                trace_lookup = trace_lookup.set_index("year_month")
+
+            frame_month = frame.copy()
+            frame_month["year_month"] = frame_month["year_month"].map(_norm_ym)
+            factor_counts = (
+                frame_month.groupby("year_month")[factor_name]
+                .apply(lambda s: s.notna().sum())
+                .to_dict()
+            )
+
             records = []
             for _, row in cal.iterrows():
                 ym = row["year_month"]
-                t_buy = row["buy_date"]
-                market_snap = self.limit_df[self.limit_df["date"] == t_buy]
-                market_count = len(market_snap)
-                factor_snap = frame[frame["year_month"] == ym]
-                factor_count = factor_snap[factor_name].notna().sum()
-                coverage = factor_count / market_count if market_count > 0 else 0
+                ym_key = _norm_ym(ym)
+                factor_count = int(factor_counts.get(ym_key, 0))
+                pool_count = 0
+                if trace_lookup is not None and ym_key in trace_lookup.index:
+                    try:
+                        pool_count = int(pd.to_numeric(trace_lookup.loc[ym_key, denom_col], errors="coerce"))
+                    except Exception:
+                        pool_count = 0
+                coverage = factor_count / pool_count if pool_count > 0 else 0
                 records.append({
-                    "year_month": ym,
-                    "date": t_buy,
+                    "year_month": ym_key,
+                    "date": row["buy_date"],
                     "factor_count": int(factor_count),
-                    "market_count": int(market_count),
+                    "market_count": int(pool_count),
+                    "stock_pool_count": int(pool_count),
                     "coverage": float(coverage),
                 })
             return pd.DataFrame(records)
 
-        df_coverage_all = _build_coverage_records(df1)
-        df_coverage_all_cs = df_coverage_all.copy()
-
         df1 = self._apply_stock_pool_filter(df1, cal)
 
-        df_coverage_tradeable = _build_coverage_records(df1)
+        df_coverage_all = _build_coverage_records(df1_all, "candidate_count")
+        df_coverage_all_cs = df_coverage_all.copy()
+
+        df_coverage_tradeable = _build_coverage_records(df1, "tradeable_count")
         df_coverage_tradeable_cs = df_coverage_tradeable.copy()
+
+        # 便于核对图2(覆盖度)分子/分母
+        try:
+            df_coverage_all.to_csv(
+                os.path.join(self.out_dir, "coverage_all_detail.csv"),
+                index=False,
+                encoding="utf-8-sig",
+            )
+            df_coverage_tradeable.to_csv(
+                os.path.join(self.out_dir, "coverage_tradeable_detail.csv"),
+                index=False,
+                encoding="utf-8-sig",
+            )
+        except Exception:
+            pass
 
         # ============ 4. 分组 ============
         df1, n_groups = self._assign_groups(df1, target_factor, group_size)
+        df1 = self._limit_group_top_n(df1, target_factor, top_n_per_group)
+        self._attach_group_counts_to_trace(df1, n_groups)
 
         # ============ 5. 调仓循环 ============
 
@@ -246,7 +312,7 @@ class BacktestCoreMixin:
         )
 
         holding_period_returns, ic_records = self._run_trading_loop(
-            df1, cal, target_factor, commission
+            df1, cal, target_factor, commission, rebalance_month_end_close
         )
 
         if not holding_period_returns:
@@ -278,6 +344,7 @@ class BacktestCoreMixin:
 
         # ============ 9. 计算 KPI ============
         df_ic = pd.DataFrame(ic_records)
+        self._export_ic_series(df_ic)
         n_total_symbols = self.df_daily["symbol"].nunique()
 
         kpis = compute_backtest_kpis(
@@ -296,9 +363,47 @@ class BacktestCoreMixin:
             df_coverage_tradeable=df_coverage_tradeable,
             df_coverage_all_cs=df_coverage_all_cs,
             df_coverage_tradeable_cs=df_coverage_tradeable_cs,
-            df1_all=df1,
+            df1_all=df1_all,
             source_factor_col=source_factor_col,
         )
+
+    @staticmethod
+    def _mad_clip_only(series, n=3.0):
+        s = series.copy()
+        median = s.median()
+        mad = (s - median).abs().median()
+        if pd.isna(mad) or mad == 0:
+            return s
+        upper, lower = median + n * mad, median - n * mad
+        return s.clip(lower=lower, upper=upper)
+
+    @staticmethod
+    def _standardize_cross_section(series):
+        s = pd.to_numeric(series, errors="coerce")
+        mean = s.mean()
+        std = s.std()
+        if pd.isna(std) or std == 0:
+            return s - mean
+        return (s - mean) / std
+
+    def _limit_group_top_n(self, df1, target_factor, top_n_per_group: int):
+        if top_n_per_group is None or int(top_n_per_group) <= 0:
+            return df1
+
+        n = int(top_n_per_group)
+        before = len(df1)
+        limited = (
+            df1.sort_values(
+                ["year_month", "group", target_factor, "symbol"],
+                ascending=[True, True, False, True],
+            )
+            .groupby(["year_month", "group"], group_keys=False)
+            .head(n)
+            .copy()
+        )
+        after = len(limited)
+        self.logger.info(f"已启用每组TopN限制: N={n}, 样本量 {before} -> {after}")
+        return limited
 
     # ------------------------------------------------------------------
     # run_backtest 内部子步骤 (私有方法)
@@ -369,8 +474,9 @@ class BacktestCoreMixin:
             df1["_mv_pct"] = df1.groupby("year_month")["lncap"].transform(
                 lambda x: x.rank(pct=True)
             )
-            df1 = df1[df1["_mv_pct"] > 0.20].drop(columns=["_mv_pct"])
-            self.logger.info("已完成市值对数提取, 并于每期截面剔除市值后 20% 的微盘股")
+            # df1 = df1[df1["_mv_pct"] > 0.20].drop(columns=["_mv_pct"])
+            df1 = df1.drop(columns=["_mv_pct"])
+            self.logger.info("已完成市值对数提取, 已禁用微盘股过滤（保留全部标的）")
         else:
             self.logger.warning("未提供市值因子数据, 市值过滤环节效果受限")
             df1["lncap"] = 1.0
@@ -409,13 +515,13 @@ class BacktestCoreMixin:
             pd.DataFrame: 经过流动性筛选后的干净因子池。
         """
         filtered_dfs = []
+        trace_records = []
         for _, row in cal.iterrows():
             ym = row["year_month"]
             t_buy = row["buy_date"]
 
             signal_df = df1[df1["year_month"] == ym].copy()
-            if signal_df.empty:
-                continue
+            candidate_count = int(len(signal_df))
 
             # --- 流动性提前筛选 ---
             valid_liq = self._get_strict_liq_symbols(t_buy)
@@ -424,6 +530,16 @@ class BacktestCoreMixin:
             else:
                 signal_df = signal_df.iloc[0:0]
 
+            tradeable_count = int(len(signal_df))
+            trace_records.append(
+                {
+                    "year_month": str(ym),
+                    "date": t_buy,
+                    "candidate_count": candidate_count,
+                    "tradeable_count": tradeable_count,
+                }
+            )
+
             # --- ST 过滤 ---
             # (如果开启了 --enable-st-filter，self.st_df 已经合并到 df1 还是单独查？)
             # 根据现有框架，原先 ST 过滤也是直接用 mask 来做的，现在可以在这里结合。
@@ -431,9 +547,17 @@ class BacktestCoreMixin:
 
             filtered_dfs.append(signal_df)
         
+        self.stock_pool_trace_df = pd.DataFrame(trace_records)
+        trace_path = os.path.join(self.out_dir, "stock_pool_trace.csv")
+        try:
+            self.stock_pool_trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
+            self.logger.info(f"每期股票池数量追踪已保存: {trace_path}")
+        except Exception as e:
+            self.logger.debug(f"股票池追踪落盘失败 (非致命): {e}")
+
         if not filtered_dfs:
             return pd.DataFrame(columns=df1.columns)
-            
+
         return pd.concat(filtered_dfs, ignore_index=True)
 
     def _assign_groups(self, df1, target_factor, group_size):
@@ -514,7 +638,61 @@ class BacktestCoreMixin:
             self.logger.info(f"按固定 10 组均分, 实际有效分组数: {n_groups}")
         return df1, n_groups
 
-    def _run_trading_loop(self, df1, cal, target_factor, commission):
+    def _attach_group_counts_to_trace(self, df1, n_groups):
+        trace_df = getattr(self, "stock_pool_trace_df", None)
+        if trace_df is None or trace_df.empty:
+            return
+
+        group_counts = (
+            df1.groupby(["year_month", "group"]).size().unstack(fill_value=0)
+        )
+        group_counts.index = group_counts.index.astype(str)
+        group_counts = group_counts.reset_index()
+
+        rename_map = {}
+        for col in group_counts.columns:
+            if col == "year_month":
+                continue
+            try:
+                group_id = int(float(col))
+            except (TypeError, ValueError):
+                continue
+            rename_map[col] = f"group_{group_id}_count"
+        if rename_map:
+            group_counts = group_counts.rename(columns=rename_map)
+
+        group_cols = [
+            c for c in group_counts.columns
+            if isinstance(c, str) and c.startswith("group_") and c.endswith("_count")
+        ]
+        if group_cols:
+            group_counts["n_groups"] = (group_counts[group_cols] > 0).sum(axis=1).astype(int)
+            group_counts["group_total_count"] = group_counts[group_cols].sum(axis=1).astype(int)
+        else:
+            group_counts["n_groups"] = 0
+            group_counts["group_total_count"] = 0
+
+        updated = trace_df.copy()
+        updated["year_month"] = updated["year_month"].astype(str)
+        updated = pd.merge(updated, group_counts, on="year_month", how="left")
+
+        for col in [
+            c for c in updated.columns
+            if isinstance(c, str) and c.startswith("group_") and c.endswith("_count")
+        ]:
+            updated[col] = updated[col].fillna(0).astype(int)
+        updated["n_groups"] = updated["n_groups"].fillna(0).astype(int)
+        updated["group_total_count"] = updated["group_total_count"].fillna(0).astype(int)
+
+        self.stock_pool_trace_df = updated
+        trace_path = os.path.join(self.out_dir, "stock_pool_trace.csv")
+        try:
+            self.stock_pool_trace_df.to_csv(trace_path, index=False, encoding="utf-8-sig")
+            self.logger.info(f"每期股票池与分组数量追踪已保存: {trace_path}")
+        except Exception as e:
+            self.logger.debug(f"分组追踪落盘失败 (非致命): {e}")
+
+    def _run_trading_loop(self, df1, cal, target_factor, commission, rebalance_month_end_close=False):
         """
         步骤5: 调仓循环仿真引擎 (Trading Simulator Loop)
 
@@ -544,6 +722,7 @@ class BacktestCoreMixin:
             ym = row["year_month"]
             t_buy = row["buy_date"]
             t_sell = row["sell_date"]
+            t_buy_px = t_buy
 
             signal_df = df1[df1["year_month"] == ym].copy()
             if signal_df.empty:
@@ -557,37 +736,56 @@ class BacktestCoreMixin:
                 continue
 
             # --- 买入 (以 VWAP 均价撮合) ---
-            buy_mask = self._get_trade_mask([t_buy])
+            buy_mask = self._get_trade_mask([t_buy_px])
             buy_mask = buy_mask[buy_mask["symbol"].isin(valid_liq)]
-            valid_buys = buy_mask[~buy_mask["is_limit_up"]].copy()
-            # 计算复权 VWAP: adj_vwap = vwap * (adj_close / close)
-            valid_buys["adj_vwap"] = valid_buys["vwap"] * (
-                valid_buys["adj_close"] / valid_buys["close"]
-            )
+            if rebalance_month_end_close:
+                valid_buys = buy_mask[buy_mask["can_buy"]].copy()
+                valid_buys = valid_buys.rename(columns={"close": "buy_price", "adj_close": "buy_adj_price"})
+                buy_cols = ["symbol", "buy_price", "buy_adj_price"]
+            else:
+                valid_buys = buy_mask[~buy_mask["is_limit_up"]].copy()
+                # 计算复权 VWAP: adj_vwap = vwap * (adj_close / close)
+                valid_buys["adj_vwap"] = valid_buys["vwap"] * (
+                    valid_buys["adj_close"] / valid_buys["close"]
+                )
+                buy_cols = ["symbol", "vwap", "adj_vwap"]
             trade1 = pd.merge(
                 signal_df,
-                valid_buys[["symbol", "vwap", "adj_vwap"]],
+                valid_buys[buy_cols],
                 on="symbol", how="inner",
             )
-            trade1 = trade1.rename(columns={"vwap": "buy_price", "adj_vwap": "buy_adj_price"})
+            if not rebalance_month_end_close:
+                trade1 = trade1.rename(columns={"vwap": "buy_price", "adj_vwap": "buy_adj_price"})
             if trade1.empty:
                 continue
+            # 统一口径: 交易记录中的买入价格统一使用复权价。
+            trade1["buy_price"] = trade1["buy_adj_price"]
 
             # --- 卖出 (以 VWAP 均价撮合) ---
             sell_mask = self._get_trade_mask([t_sell])
-            t_sell_actual = sell_mask[~sell_mask["is_limit_down"]].copy()
-            t_sell_actual["adj_vwap"] = t_sell_actual["vwap"] * (
-                t_sell_actual["adj_close"] / t_sell_actual["close"]
-            )
-            delayed_symbols = sell_mask[sell_mask["is_limit_down"]]["symbol"].tolist()
+            if rebalance_month_end_close:
+                t_sell_actual = sell_mask.copy()
+                t_sell_actual = t_sell_actual.rename(columns={"close": "sell_price", "adj_close": "sell_adj_price"})
+                sell_cols = ["symbol", "sell_price", "sell_adj_price"]
+            else:
+                # 按调仓日统一执行卖出：即使跌停也按当日价格处理，不再顺延。
+                t_sell_actual = sell_mask.copy()
+                t_sell_actual["adj_vwap"] = t_sell_actual["vwap"] * (
+                    t_sell_actual["adj_close"] / t_sell_actual["close"]
+                )
+                sell_cols = ["symbol", "vwap", "adj_vwap"]
+            delayed_symbols = []
 
             trade2 = pd.merge(
                 trade1,
-                t_sell_actual[["symbol", "vwap", "adj_vwap"]],
+                t_sell_actual[sell_cols],
                 on="symbol", how="left",
             )
-            trade2 = trade2.rename(columns={"vwap": "sell_price", "adj_vwap": "sell_adj_price"})
+            if not rebalance_month_end_close:
+                trade2 = trade2.rename(columns={"vwap": "sell_price", "adj_vwap": "sell_adj_price"})
             trade2["sell_date"] = t_sell
+            # 统一口径: 交易记录中的卖出价格统一使用复权价。
+            trade2["sell_price"] = trade2["sell_adj_price"]
 
             # --- 延迟卖出 ---
             trade2 = self._handle_delayed_sells(trade2, delayed_symbols, t_sell, ym, t_buy)
@@ -628,63 +826,11 @@ class BacktestCoreMixin:
         返回:
             pd.DataFrame: 更新了卖出价格与日期的交易表。
         """
+        # 当前口径：不做跌停顺延与极端强平，卖出价格统一来自调仓日撮合。
         if delayed_symbols:
-            future_dates = self.trade_dates[self.trade_dates > t_sell][:5]
-            if len(future_dates) > 0:
-                future_df = self.limit_df[
-                    (self.limit_df["symbol"].isin(delayed_symbols))
-                    & (self.limit_df["date"].isin(future_dates))
-                ].copy()
-                if not future_df.empty:
-                    future_df["can_sell"] = (~future_df["is_limit_down"]) & (future_df["vol"] > 0)
-                    # 计算复权 VWAP
-                    future_df["adj_vwap"] = future_df["vwap"] * (
-                        future_df["adj_close"] / future_df["close"]
-                    )
-                    first_sell = (
-                        future_df[future_df["can_sell"]]
-                        .sort_values("date").groupby("symbol").first().reset_index()
-                    )
-                    if not first_sell.empty:
-                        update_cols = ["symbol", "vwap", "adj_vwap", "date"]
-                        renames = {"vwap": "sell_price", "adj_vwap": "sell_adj_price", "date": "sell_date"}
-                        fsu = first_sell[update_cols].rename(columns=renames)
-                        fsu.set_index("symbol", inplace=True)
-                        trade2.set_index("symbol", inplace=True)
-                        trade2.update(fsu)
-                        trade2.reset_index(inplace=True)
-                        self.logger.debug(f"{ym} {len(first_sell)} 只股票卖出顺延成功")
-
-        # 极端退出: 5个交易日(一周)仍无法卖出
-        drop_mask = trade2["sell_adj_price"].isna()
-        if drop_mask.sum() > 0:
-            self.logger.warning(
-                f"当期 {ym}: {drop_mask.sum()} 笔标的极端出局失败, 强制以最后一日 VWAP 结转"
+            self.logger.debug(
+                f"{ym} 存在 {len(delayed_symbols)} 只跌停标的，按调仓日价格直接卖出（不顺延）"
             )
-            delayed_extreme = trade2[drop_mask]["symbol"].tolist()
-            future_ext = self.trade_dates[self.trade_dates > t_sell][:5]
-            if len(future_ext) > 0:
-                last_date = future_ext[-1]
-                me = self.df_daily[
-                    (self.df_daily["symbol"].isin(delayed_extreme))
-                    & (self.df_daily["date"] == last_date)
-                ].copy()
-                if not me.empty:
-                    # 极端退出也以 VWAP 撮合
-                    me["adj_vwap"] = me["vwap"] * (me["adj_close"] / me["close"])
-                    renames = {"vwap": "sell_price", "adj_vwap": "sell_adj_price", "date": "sell_date"}
-                    eu = me[["symbol", "vwap", "adj_vwap", "date"]].rename(columns=renames)
-                    eu.set_index("symbol", inplace=True)
-                    trade2.set_index("symbol", inplace=True)
-                    trade2.update(eu)
-                    trade2.reset_index(inplace=True)
-
-        # 退市止损
-        still_drop = trade2["sell_adj_price"].isna()
-        if still_drop.sum() > 0:
-            trade2.loc[still_drop, "sell_adj_price"] = trade2.loc[still_drop, "buy_adj_price"] * 0.5
-            self.logger.error(f"极端退市清算: {still_drop.sum()} 只标的以买入价50%强制结转")
-
         return trade2
 
     def _compute_period_ic(self, trade2, target_factor, ym):
@@ -715,6 +861,55 @@ class BacktestCoreMixin:
             ic, _ = pearsonr(valid[target_factor].values, valid["actual_ret"].values)
             return {"year_month": ym, "ic": ic, "rank_ic": rank_ic}
         return None
+
+    def _compute_group_ic_series(self, holding_period_returns, target_factor, group_id):
+        """在指定分组样本内逐期计算 IC/RankIC 序列。"""
+        records = []
+        for trade2 in holding_period_returns:
+            if trade2 is None or trade2.empty:
+                continue
+            if "group" not in trade2.columns:
+                continue
+            grp = trade2[trade2["group"] == group_id]
+            if grp.empty:
+                continue
+            ym = grp["year_month"].iloc[0] if "year_month" in grp.columns else None
+            if ym is None:
+                continue
+            rec = self._compute_period_ic(grp, target_factor, ym)
+            if rec:
+                records.append(rec)
+        return pd.DataFrame(records)
+
+    def _compute_all_groups_ic_series(self, holding_period_returns, target_factor, max_group):
+        """逐组计算 IC/RankIC 序列并汇总。"""
+        group_dfs = []
+        for gid in range(1, int(max_group) + 1):
+            gdf = self._compute_group_ic_series(holding_period_returns, target_factor, gid)
+            if gdf is None or gdf.empty:
+                continue
+            gdf = gdf.copy()
+            gdf["group"] = int(gid)
+            group_dfs.append(gdf)
+        if not group_dfs:
+            return pd.DataFrame(columns=["year_month", "group", "ic", "rank_ic"])
+        return pd.concat(group_dfs, ignore_index=True)
+
+    def _export_ic_series(self, df_ic):
+        """导出总样本 IC 序列。"""
+        try:
+            total_out = os.path.join(self.out_dir, "ic_series_total.csv")
+
+            total_df = (
+                df_ic.copy()
+                if df_ic is not None and not df_ic.empty
+                else pd.DataFrame(columns=["year_month", "ic", "rank_ic"])
+            )
+            total_df.to_csv(total_out, index=False, encoding="utf-8-sig")
+
+            self.logger.info("IC序列已导出: %s", total_out)
+        except Exception as e:
+            self.logger.debug("IC序列导出失败 (非致命): %s", e)
 
     def _compute_group_returns(self, holding_period_returns):
         """
@@ -862,7 +1057,7 @@ class BacktestCoreMixin:
                 ("因子导入", f"区间 {start_month}~{end_month} <br>调仓顺延: {delay_days} 天" if delay_days > 0 else f"区间 {start_month}~{end_month}", "cyan"),
                 ("预处理截面", "3MAD 去极值 + Z-Score 标准化", "purple"),
                 ("截面中性化", "默认开启<br>行业 + 市值中性化残差", "amber"),
-                ("股票池筛查", "过滤 ST 与退市警告<br>剔除上市不足60天次新股", "rose"),
+                ("股票池筛查", "过滤 ST 与退市警告<br>剔除次新股并记录每期池子数量", "rose"),
                 ("截面分组", f"<code>{max_group}</code> 组均分<br>最优 G{best_g} / 最差 G{worst_g}", "emerald"),
             ]
         )

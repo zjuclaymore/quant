@@ -12,16 +12,17 @@
 """
 
 import os
+import json
 import logging
-import warnings
-
-warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
 from .data_loader import load_calendar, load_benchmark_component
 
 from back_test.sigle_factor_test.src.bt_core import BacktestCoreMixin
+
+
+WORKSPACE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 
 class SingleFactorBacktesterV2(BacktestCoreMixin):
@@ -42,6 +43,9 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         liq_df / limit_df (pd.DataFrame): 预计算得到的流动性与涨跌停状态。
     """
 
+    STOCK_POOL_CACHE_VERSION = "mid_file_v1"
+    NEW_STOCK_DAYS = 60
+
     def __init__(
         self,
         df_daily_price: pd.DataFrame,
@@ -50,6 +54,7 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         ind_df: pd.DataFrame = None,
         index_daily_dir: str = None,
         delay_days: int = 0,
+        rebalance_month_start: bool = False,
     ):
         """
         初始化回测引擎并激活全局预处理管线
@@ -62,7 +67,7 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
             st_df (pd.DataFrame, 可选): 
                 ST 状态区间记录。用于在 `_get_trade_mask` 阶段进行标的剔除。
             ind_df (pd.DataFrame, 可选): 
-                行业分类映射表。启用行业中性化的必要输入。
+                兼容保留参数。当前回测侧不再执行行业中性化，行业暴露处理应在因子预处理阶段完成。
             index_daily_dir (str, 可选): 
                 基准成分股与收盘价的 pickle 目录。用于计算超额收益及 IC 参照系。
             delay_days (int, 默认 0): 
@@ -78,6 +83,8 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         """
         self.out_dir = out_dir
         os.makedirs(out_dir, exist_ok=True)
+        self.delay_days = int(delay_days)
+        self.rebalance_month_start = bool(rebalance_month_start)
 
         self.index_daily_dir = index_daily_dir
         self.bench_cache = {}
@@ -133,15 +140,21 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
             f"日期范围: {self.df_daily['date'].min()} ~ {self.df_daily['date'].max()}"
         )
 
-        # --- ST 与行业数据 ---
+        # --- ST 数据 ---
         self._load_st_data(st_df)
-        self._load_ind_data(ind_df)
+
+        # --- 行业数据（强制） ---
+        if ind_df is None or ind_df.empty:
+            raise ValueError("行业数据为必需输入，禁止空值或缺失")
+        self.ind_df = ind_df.copy()
+        self.logger.info(f"行业数据已加载: {len(self.ind_df)} 条")
 
         # --- 全局预处理 ---
         self._build_calendar(delay_days)
         self._precompute_first_dates()
         self._precompute_liquidity()
         self._precompute_limit_flags()
+        self._build_stock_pool_cache()
 
         self.logger.info("=== 初始化及预处理全部完成 ===")
 
@@ -187,27 +200,10 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
             若输入非空，则将其挂载至 `self.st_df`。该数据在 `_get_trade_mask` 阶段用于
             通过区间重叠算法剔除处于 ST/退市状态的风险标的。
         """
-        if st_df is not None and not st_df.empty:
-            self.st_df = st_df
-            self.logger.info(f"ST数据已加载: {len(st_df)} 条区间记录")
-        else:
-            self.st_df = pd.DataFrame()
-            self.logger.info("未提供ST数据, ST过滤将跳过")
-
-    def _load_ind_data(self, ind_df):
-        """
-        同步本地行业分类数据资产
-
-        逻辑说明:
-            挂载申万行业分类表。这是启用“行业中性化”的核心依赖，
-            回测主流程将根据此表在每个截面由于对齐标的的行业标签。
-        """
-        if ind_df is not None and not ind_df.empty:
-            self.ind_df = ind_df
-            self.logger.info(f"行业分类数据已加载: {len(ind_df)} 条记录")
-        else:
-            self.ind_df = pd.DataFrame()
-            self.logger.info("未提供行业分类数据, 行业中性化将跳过")
+        if st_df is None or st_df.empty:
+            raise ValueError("ST数据为必需输入，禁止空值或缺失")
+        self.st_df = st_df
+        self.logger.info(f"ST数据已加载: {len(st_df)} 条区间记录")
 
     # ==========================================
     # 调仓日历构建
@@ -222,7 +218,12 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
             通过 `data_loader.load_calendar` 读取缓存并注入发车延迟参数。
             生成的 `self.df_calendar` 决定了信号触发与买卖撮合的精确时间轴。
         """
-        self.df_calendar, self.trade_dates = load_calendar(self.df_daily, delay_days, self.logger)
+        self.df_calendar, self.trade_dates = load_calendar(
+            self.df_daily,
+            delay_days,
+            self.rebalance_month_start,
+            self.logger,
+        )
 
     # ==========================================
     # 全局预处理
@@ -321,6 +322,214 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         self.limit_df = df
         self.logger.info("涨跌停标记预处理完成")
 
+    def _build_stock_pool_cache(self):
+        """
+        全局预处理 4: 生成并落盘可交易股票池表 (Stock Pool Cache)
+
+        产物:
+            1) mid_file/stock_trade_pool.parquet
+               字段包含代码、时间、量价信息及交易掩码(可买/可卖)。
+            2) mid_file/filter_rules.json
+               描述股票池筛选规则与样本统计，便于复盘口径。
+        """
+        self.logger.info("开始全局预处理: 生成股票池交易表缓存...")
+
+        # 股票池作为全局复用资产，落盘到项目根目录的 mid_file 目录，供后续同口径回测直接读取
+        cache_dir = os.path.join(WORKSPACE_ROOT, "mid_file")
+        os.makedirs(cache_dir, exist_ok=True)
+        pool_path = os.path.join(cache_dir, "stock_trade_pool.parquet")
+        explain_path = os.path.join(cache_dir, "filter_rules.json")
+
+        expected_meta = self._build_stock_pool_meta(stats=None)
+        cache_hit, cached_df, reason = self._try_load_stock_pool_cache(pool_path, explain_path, expected_meta)
+        # if cache_hit:
+        #     self.stock_pool_df = cached_df
+        #     self.logger.info(f"股票池缓存命中并复用: {pool_path}")
+        #     return
+        self.logger.info(f"股票池缓存未命中，重建原因: {reason}")
+
+        df = self.limit_df.copy()
+
+        # 统一基础可交易掩码：非停牌 + 非北交所 + 非次新 + 非ST
+        df["is_not_suspended"] = df["vol"].notna() & (df["vol"] > 0)
+        df["is_not_bj"] = ~df["symbol"].astype(str).str.endswith(".BJ")
+
+        # 次新股过滤
+        df = pd.merge(df, self.first_dates, on="symbol", how="left")
+        df["is_not_new"] = df["date"] >= (df["first_date"] + pd.Timedelta(days=self.NEW_STOCK_DAYS))
+
+        # ST 过滤（向量化）
+        df["is_not_st"] = True
+        if not self.st_df.empty:
+            try:
+                st_cols = self.st_df.columns.tolist()
+                if "S_INFO_WINDCODE" in st_cols and "ENTRY_DT" in st_cols:
+                    st_intervals = self.st_df[["S_INFO_WINDCODE", "ENTRY_DT", "REMOVE_DT"]].copy()
+                    st_intervals = st_intervals.rename(columns={"S_INFO_WINDCODE": "symbol"})
+                    st_intervals["ENTRY_DT"] = pd.to_datetime(st_intervals["ENTRY_DT"].astype(str), errors="coerce")
+                    st_intervals["REMOVE_DT"] = pd.to_datetime(
+                        st_intervals["REMOVE_DT"].astype(str), errors="coerce"
+                    ).fillna(pd.Timestamp("2099-12-31"))
+
+                    target_df = df[["date", "symbol"]].copy()
+                    merged = pd.merge(target_df, st_intervals, on="symbol", how="inner")
+                    st_hits = merged[
+                        (merged["date"] >= merged["ENTRY_DT"]) & (merged["date"] <= merged["REMOVE_DT"])
+                    ]
+                    if not st_hits.empty:
+                        hit_keys = st_hits[["date", "symbol"]].drop_duplicates().set_index(["date", "symbol"]).index
+                        df["is_not_st"] = ~df.set_index(["date", "symbol"]).index.isin(hit_keys)
+            except Exception as e:
+                self.logger.debug(f"股票池 ST 过滤预处理异常 (非致命): {e}")
+
+        df["tradable_base"] = df["is_not_suspended"] & df["is_not_bj"] & df["is_not_new"] & df["is_not_st"]
+        df["can_buy"] = df["tradable_base"] & (~df["is_limit_up"])
+        df["can_sell"] = df["tradable_base"] & (~df["is_limit_down"])
+
+        keep_cols = [
+            "date", "symbol", "open", "high", "low", "close", "adj_close", "vwap", "vol",
+            "up_limit", "down_limit", "is_limit_up", "is_limit_down",
+            "tradable_base", "can_buy", "can_sell",
+        ]
+        self.stock_pool_df = df[keep_cols].copy()
+
+        self.stock_pool_df.to_parquet(pool_path, index=False)
+
+        stats = {
+            "rows_total": int(len(self.stock_pool_df)),
+            "rows_tradable_base": int(self.stock_pool_df["tradable_base"].sum()),
+            "rows_can_buy": int(self.stock_pool_df["can_buy"].sum()),
+            "rows_can_sell": int(self.stock_pool_df["can_sell"].sum()),
+            "unique_symbols": int(self.stock_pool_df["symbol"].nunique()),
+            "date_start": str(self.stock_pool_df["date"].min()),
+            "date_end": str(self.stock_pool_df["date"].max()),
+        }
+        explain = self._build_stock_pool_meta(stats=stats)
+        with open(explain_path, "w", encoding="utf-8") as f:
+            json.dump(explain, f, ensure_ascii=False, indent=2)
+
+        self.logger.info(f"股票池缓存已生成: {pool_path}")
+        self.logger.info(f"股票池筛选说明已生成: {explain_path}")
+
+    def _st_signature(self):
+        if self.st_df is None or self.st_df.empty:
+            return {"enabled": False}
+
+        cols = self.st_df.columns.tolist()
+        if "S_INFO_WINDCODE" not in cols or "ENTRY_DT" not in cols:
+            return {
+                "enabled": True,
+                "format": "unknown",
+                "rows": int(len(self.st_df)),
+                "columns": cols,
+            }
+
+        tmp = self.st_df[["S_INFO_WINDCODE", "ENTRY_DT", "REMOVE_DT"]].copy()
+        tmp["ENTRY_DT"] = pd.to_datetime(tmp["ENTRY_DT"].astype(str), errors="coerce")
+        tmp["REMOVE_DT"] = pd.to_datetime(tmp["REMOVE_DT"].astype(str), errors="coerce")
+
+        return {
+            "enabled": True,
+            "format": "wind_interval",
+            "rows": int(len(tmp)),
+            "symbols": int(tmp["S_INFO_WINDCODE"].nunique()),
+            "entry_min": str(tmp["ENTRY_DT"].min()),
+            "entry_max": str(tmp["ENTRY_DT"].max()),
+            "remove_min": str(tmp["REMOVE_DT"].min()),
+            "remove_max": str(tmp["REMOVE_DT"].max()),
+        }
+
+    def _calendar_signature(self):
+        if getattr(self, "trade_dates", None) is None or len(self.trade_dates) == 0:
+            return {"count": 0}
+        return {
+            "count": int(len(self.trade_dates)),
+            "min": str(min(self.trade_dates)),
+            "max": str(max(self.trade_dates)),
+            "delay_days": int(getattr(self, "delay_days", 0)),
+        }
+
+    def _build_stock_pool_meta(self, stats=None):
+        filters = [
+            "停牌过滤: vol > 0 且非空",
+            "北交所过滤: symbol 不以 .BJ 结尾",
+            f"次新股过滤: date >= first_date + {self.NEW_STOCK_DAYS}天",
+            "ST过滤: 不在 [ENTRY_DT, REMOVE_DT] 区间",
+        ]
+        return {
+            "version": self.STOCK_POOL_CACHE_VERSION,
+            "generated_at": pd.Timestamp.now().isoformat(),
+            "source": "SingleFactorBacktesterV2._build_stock_pool_cache",
+            "filters": filters,
+            "mask_definitions": {
+                "tradable_base": "通过全部基础过滤",
+                "can_buy": "tradable_base 且非一字涨停",
+                "can_sell": "tradable_base 且非一字跌停",
+            },
+            "spec": {
+                "new_stock_days": int(self.NEW_STOCK_DAYS),
+                "exclude_bj": True,
+                "suspend_rule": "vol_notna_and_gt0",
+                "st_rule": "wind_interval_active",
+                "buy_sell_rule": "limit_up_down_guard",
+            },
+            "validation": {
+                "daily_rows": int(len(self.limit_df)),
+                "daily_symbols": int(self.limit_df["symbol"].nunique()),
+                "daily_date_min": str(self.limit_df["date"].min()),
+                "daily_date_max": str(self.limit_df["date"].max()),
+                "calendar": self._calendar_signature(),
+                "st_signature": self._st_signature(),
+            },
+            "stats": stats or {},
+            "files": {
+                "trade_table": "stock_trade_pool.parquet",
+                "explain": "filter_rules.json",
+            },
+        }
+
+    def _try_load_stock_pool_cache(self, pool_path, explain_path, expected_meta):
+        if not (os.path.exists(pool_path) and os.path.exists(explain_path)):
+            return False, None, "缓存文件不存在"
+
+        try:
+            with open(explain_path, "r", encoding="utf-8") as f:
+                cache_meta = json.load(f)
+        except Exception as e:
+            return False, None, f"读取筛选说明失败: {e}"
+
+        mismatches = []
+        if cache_meta.get("version") != expected_meta.get("version"):
+            mismatches.append("version")
+        if cache_meta.get("spec") != expected_meta.get("spec"):
+            mismatches.append("spec")
+        if cache_meta.get("filters") != expected_meta.get("filters"):
+            mismatches.append("filters")
+        if cache_meta.get("validation") != expected_meta.get("validation"):
+            mismatches.append("validation")
+
+        if mismatches:
+            return False, None, f"元信息不匹配: {','.join(mismatches)}"
+
+        try:
+            cache_df = pd.read_parquet(pool_path)
+        except Exception as e:
+            return False, None, f"读取缓存表失败: {e}"
+
+        required_cols = {
+            "date", "symbol", "open", "high", "low", "close", "adj_close", "vwap", "vol",
+            "up_limit", "down_limit", "is_limit_up", "is_limit_down",
+            "tradable_base", "can_buy", "can_sell",
+        }
+        if not required_cols.issubset(set(cache_df.columns)):
+            return False, None, "缓存表字段不完整"
+
+        cache_df["date"] = pd.to_datetime(cache_df["date"], errors="coerce")
+        if cache_df["date"].isna().any():
+            return False, None, "缓存表日期字段异常"
+
+        return True, cache_df, "ok"
+
     # ==========================================
     # 截面数据检索
     # ==========================================
@@ -343,55 +552,23 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         返回:
             pd.DataFrame: 合格标的的截面属性表。
         """
-        df_d = self.limit_df[self.limit_df["date"].isin(target_dates)].copy()
-
-        # 1. 停牌过滤 (vol == 0 or nan)
-        if "vol" in df_d.columns:
-            df_d = df_d[(df_d["vol"].notna()) & (df_d["vol"] > 0)]
-
-        # 2. ST 过滤 (向量化区间并发比对)
-        if not self.st_df.empty:
-            try:
-                st_cols = self.st_df.columns.tolist()
-                if "S_INFO_WINDCODE" in st_cols and "ENTRY_DT" in st_cols:
-                    st_intervals = self.st_df[
-                        ["S_INFO_WINDCODE", "ENTRY_DT", "REMOVE_DT"]
-                    ].copy()
-                    st_intervals.rename(
-                        columns={"S_INFO_WINDCODE": "symbol"}, inplace=True
-                    )
-                    st_intervals["ENTRY_DT"] = pd.to_datetime(
-                        st_intervals["ENTRY_DT"].astype(str), errors="coerce"
-                    )
-                    st_intervals["REMOVE_DT"] = pd.to_datetime(
-                        st_intervals["REMOVE_DT"].astype(str), errors="coerce"
-                    ).fillna(pd.Timestamp("2099-12-31"))
-
-                    target_df = df_d[["date", "symbol"]].copy()
-                    merged = pd.merge(target_df, st_intervals, on="symbol", how="inner")
-                    st_hits = merged[
-                        (merged["date"] >= merged["ENTRY_DT"])
-                        & (merged["date"] <= merged["REMOVE_DT"])
-                    ]
-
-                    if not st_hits.empty:
-                        hit_keys = st_hits.set_index(["date", "symbol"]).index
-                        df_d = df_d[
-                            ~df_d.set_index(["date", "symbol"]).index.isin(hit_keys)
-                        ]
-            except Exception as e:
-                self.logger.debug(f"ST 过滤异常 (非致命): {e}")
-
-        # 3. 次新股过滤 (首次出现+60天 - 内存查表)
-        df_d = pd.merge(df_d, self.first_dates, on="symbol", how="left")
-        df_d = df_d[df_d["date"] >= df_d["first_date"] + pd.Timedelta(days=60)]
-        df_d = df_d.drop(columns=["first_date"])
+        # 复用预处理缓存，避免每个调仓日重复执行过滤逻辑
+        if hasattr(self, "stock_pool_df") and self.stock_pool_df is not None:
+            df_d = self.stock_pool_df[
+                self.stock_pool_df["date"].isin(target_dates) & self.stock_pool_df["tradable_base"]
+            ].copy()
+        else:
+            df_d = self.limit_df[self.limit_df["date"].isin(target_dates)].copy()
+            if "vol" in df_d.columns:
+                df_d = df_d[(df_d["vol"].notna()) & (df_d["vol"] > 0)]
+            df_d["can_buy"] = ~df_d["is_limit_up"]
+            df_d["can_sell"] = ~df_d["is_limit_down"]
 
         return df_d[
             [
                 "date", "symbol", "close", "adj_close", "vwap",
                 "up_limit", "down_limit", "open", "high", "low",
-                "is_limit_up", "is_limit_down",
+                "is_limit_up", "is_limit_down", "can_buy", "can_sell",
             ]
         ]
 
@@ -410,8 +587,9 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
             pd.DataFrame: 包含各调仓期基准收益的序列。
         """
         if self.index_daily_dir is None or not os.path.isdir(self.index_daily_dir):
-            self.logger.warning("未提供基准指数目录, 基准收益将为0")
-            return pd.DataFrame(columns=["year_month", "bench_return"])
+            msg = f"未提供有效基准指数目录: {self.index_daily_dir}"
+            self.logger.error(msg)
+            raise FileNotFoundError(msg)
 
         self.logger.info(f"从本地加载基准指数 {benchmark_symbol} ...")
 
@@ -458,8 +636,9 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
                 self.logger.debug(f"读取基准指数 {date_str} 异常: {e}")
 
         if not bench_prices:
-            self.logger.warning(f"未能加载任何基准指数 {benchmark_symbol} 数据")
-            return pd.DataFrame(columns=["year_month", "bench_return"])
+            msg = f"未能加载任何基准指数 {benchmark_symbol} 数据"
+            self.logger.error(msg)
+            raise ValueError(msg)
 
         bench_series = pd.Series(bench_prices).sort_index()
 

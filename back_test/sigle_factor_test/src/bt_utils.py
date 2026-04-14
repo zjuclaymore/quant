@@ -5,11 +5,16 @@
 import io
 import os
 import base64
+import json
+import logging
 import warnings
 import datetime
+import re
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
+from scipy import stats
+import statsmodels.api as sm
 
 import matplotlib
 matplotlib.use("Agg")
@@ -41,13 +46,33 @@ plt.rcParams["legend.fontsize"] = 9
 _BAR_ABS_COLOR = "#4da6d9"   # 绝对收益-蓝色
 _BAR_EXC_COLOR = "#f5a01e"   # 超额收益-橙色
 
-CHART_TITLE_1 = "1.  策略净值与基准对比"
-CHART_TITLE_2 = "2.  策略对冲组合净值"
-CHART_TITLE_3 = "3.  因子分组分层测试"
-CHART_TITLE_4 = "4.  因子 IC / Rank IC 测算走势"
-CHART_TITLE_5 = "5.  因子单调性与分组超额"
-CHART_TITLE_6 = "6.  因子暴露/打分分布"
+CHART_TITLE_1 = "1.  因子分布处理流程（四子图）"
+CHART_TITLE_1_COV = "2.  因子覆盖度（四子图）"
+CHART_TITLE_2 = "2.  策略净值与基准对比"
+CHART_TITLE_3 = "3.  策略对冲组合净值"
+CHART_TITLE_4 = "4.  因子分组分层测试"
+CHART_TITLE_5 = "5.  因子 IC / Rank IC 测算走势"
+CHART_TITLE_6 = "6.  因子单调性与分组超额"
 CHART_TITLE_DAILY = "日频策略净值走势"
+
+
+class ReportChartContext:
+    """管理报告图表的本地导出顺序和路径。"""
+
+    def __init__(self, out_dir, sub_dir="charts"):
+        self.out_dir = out_dir
+        self.sub_dir = sub_dir
+        self.chart_dir = os.path.join(out_dir, sub_dir)
+        self.counter = 0
+        os.makedirs(self.chart_dir, exist_ok=True)
+
+    def next_relpath(self, title):
+        self.counter += 1
+        safe = re.sub(r"[^\w\-\u4e00-\u9fff]+", "_", str(title)).strip("_")
+        if not safe:
+            safe = f"chart_{self.counter}"
+        fname = f"{self.counter:02d}_{safe}.png"
+        return os.path.join(self.sub_dir, fname).replace("\\", "/")
 
 
 def _apply_report_caption(fig, factor_name):
@@ -307,6 +332,8 @@ REPORT_CSS = """
   }
   .plot-img { max-width: 100%; height: auto; display: block; margin: 0 auto; }
       .plot-block { margin: 10px 0 22px; }
+      .echarts-wrap { margin: 10px 0 22px; }
+      .echarts-canvas { width: 100%; height: 420px; border: 1px solid var(--border-light); border-radius: 8px; background: #ffffff; }
       /* 第4图排版修正：外层已有章节标题，隐藏重复块标题并抬高图面高度 */
     #tab-summary .plot-block:nth-of-type(3) > h4 { display: none; }
     #tab-summary .plot-block:nth-of-type(3) .plot-img {
@@ -347,6 +374,15 @@ REPORT_CSS = """
     document.getElementById(tabName).style.display = "block";
     document.getElementById(tabName).classList.add("active");
     evt.currentTarget.className += " active";
+
+        // 图表可能在隐藏容器中初始化，切换到可见后统一触发 resize 修正坐标轴。
+        setTimeout(function () {
+            if (window.__reportCharts && window.__reportCharts.length) {
+                for (var j = 0; j < window.__reportCharts.length; j++) {
+                    try { window.__reportCharts[j].resize(); } catch (e) {}
+                }
+            }
+        }, 80);
   }
 
     // 修复第4图标题重叠：隐藏与图内标题重复的外层 h4
@@ -387,7 +423,16 @@ def add_card_to_html(title, icon, items, theme_color=None):
     )
 
 
-def add_plot_to_html(html_parts, fig, title):
+def add_plot_to_html(html_parts, fig, title, chart_ctx=None):
+    if chart_ctx is not None:
+        rel_path = chart_ctx.next_relpath(title)
+        abs_path = os.path.join(chart_ctx.out_dir, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        fig.savefig(abs_path, format="png", bbox_inches="tight")
+        plt.close(fig)
+        html_parts.append(f"<div class='plot-block'><h4>{title}</h4><img class='plot-img' src='{rel_path}'></div>")
+        return html_parts
+
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
     buf.seek(0)
@@ -400,7 +445,8 @@ def add_plot_to_html(html_parts, fig, title):
 
 def build_section(title, content_html, desc=None, tab_id=None):
     desc_html = f"<p style='color:#64748b;'>{desc}</p>" if desc else ""
-    return f"<div id='{tab_id}' class='tab-content'><div class='section'><h2>{title}</h2>{desc_html}{content_html}</div></div>"
+    active_cls = " active" if tab_id == "tab-summary" else ""
+    return f"<div id='{tab_id}' class='tab-content{active_cls}'><div class='section'><h2>{title}</h2>{desc_html}{content_html}</div></div>"
 
 
 def add_table_to_html(html_parts, df, title, max_rows=60):
@@ -422,25 +468,10 @@ def add_log_block(html_parts, log_text, title="日志"):
 def write_report_html(out_dir, factor_name, html_parts):
     # html_parts 预计包含 context 头部以及各个 tab 的内容
     # We will wrap it all in .dashboard
-    
-    # 提取 tabs html
-    tabs_html = """
-    <div class="tabs">
-      <button class="tab-btn active" onclick="openTab(event, 'tab-summary')">收益概况</button>
-      <button class="tab-btn" onclick="openTab(event, 'tab-trades')">交易详情</button>
-      <button class="tab-btn" onclick="openTab(event, 'tab-daily')">每日表现</button>
-      <button class="tab-btn" onclick="openTab(event, 'tab-logs')">运行日志</button>
-    </div>
-    """
-    
-    # default script to click the first tab on load, since inline style=block is set but we want active state initialized completely
-    script_html = """
-    <script>
-      document.addEventListener("DOMContentLoaded", function() {
-        document.querySelector('.tab-btn').click();
-      });
-    </script>
-    """
+
+    # 当前模式仅保留“收益概况”，不渲染页签栏。
+    tabs_html = ""
+    script_html = ""
     
     # assume the first part in html_parts is the context_html header
     context_part = html_parts[0] if len(html_parts) > 0 else ""
@@ -452,6 +483,7 @@ def write_report_html(out_dir, factor_name, html_parts):
     <head>
         <meta charset="utf-8">
         <title>{factor_name} 回测报告</title>
+        <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
         {REPORT_CSS}
     </head>
     <body>
@@ -498,6 +530,7 @@ def write_report_html_no_trades(out_dir, factor_name, html_parts):
     <head>
         <meta charset="utf-8">
         <title>{factor_name} 回测报告 (精简版)</title>
+        <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
         {REPORT_CSS}
     </head>
     <body>
@@ -532,13 +565,26 @@ def cross_section_mad_normalize(series, n=3.0):
     return (s - mu) / sigma if sigma > 0 else s - mu
 
 
-def neutralize_factor(df, factor_col, mv_col="lncap", ind_col=None):
+def neutralize_factor(df, factor_col, mv_col="lncap", ind_col=None, logger=None, return_stats=False):
     resid_series = pd.Series(index=df.index, dtype=float)
+    stats = {
+        "rows_total": int(len(df)),
+        "rows_missing_factor": int(df[factor_col].isna().sum()) if factor_col in df.columns else int(len(df)),
+        "rows_missing_mv": int(df[mv_col].isna().sum()) if mv_col in df.columns else int(len(df)),
+        "rows_missing_ind": int(df[ind_col].isna().sum()) if ind_col and ind_col in df.columns else 0,
+        "rows_valid_neutralized": 0,
+        "months_processed": 0,
+        "months_skipped_small_sample": 0,
+        "months_failed": 0,
+    }
     for ym, group in df.groupby("year_month"):
         valid_idx = group[factor_col].notna() & group[mv_col].notna()
-        if ind_col: valid_idx &= group[ind_col].notna()
+        if ind_col:
+            valid_idx &= group[ind_col].notna()
         subset = group[valid_idx]
-        if len(subset) < 10: continue
+        if len(subset) < 10:
+            stats["months_skipped_small_sample"] += 1
+            continue
         Y = subset[factor_col].values
         X_mv = subset[mv_col].values
         if ind_col:
@@ -549,12 +595,40 @@ def neutralize_factor(df, factor_col, mv_col="lncap", ind_col=None):
         try:
             beta, _, _, _ = np.linalg.lstsq(X_mat, Y, rcond=None)
             resid_series.loc[subset.index] = Y - X_mat.dot(beta)
+            stats["rows_valid_neutralized"] += int(len(subset))
+            stats["months_processed"] += 1
         except Exception as e:
+            stats["months_failed"] += 1
             warnings.warn(f"Neutralization failed at {ym}: {e}")
+    if logger is not None:
+        logger.info(
+            "中性化统计: 总行=%s, 缺失因子=%s, 缺失市值=%s, 缺失行业=%s, 有效中性化=%s, 处理月份=%s, 小样本跳过=%s, 失败月份=%s",
+            stats["rows_total"],
+            stats["rows_missing_factor"],
+            stats["rows_missing_mv"],
+            stats["rows_missing_ind"],
+            stats["rows_valid_neutralized"],
+            stats["months_processed"],
+            stats["months_skipped_small_sample"],
+            stats["months_failed"],
+        )
+    if return_stats:
+        return resid_series, stats
     return resid_series
 
 
-def compute_backtest_kpis(best_df, worst_df, df_trades, df_ic, market_returns, cal, best_g, worst_g, df1, df_daily_nunique):
+def compute_backtest_kpis(
+    best_df,
+    worst_df,
+    df_trades,
+    df_ic,
+    market_returns,
+    cal,
+    best_g,
+    worst_g,
+    df1,
+    df_daily_nunique,
+):
     total_months = len(cal)
     ann_factor = 12 / total_months if total_months > 0 else 1
     best_ret_ann = (best_df["净值"].iloc[-1]) ** ann_factor - 1 if len(best_df) > 0 else 0
@@ -563,14 +637,83 @@ def compute_backtest_kpis(best_df, worst_df, df_trades, df_ic, market_returns, c
     roll_max = best_df["净值"].rolling(window=len(best_df), min_periods=1).max()
     drawdowns = (best_df["净值"] / roll_max - 1).astype(float)
     max_drawdown = drawdowns.min()
+
+    max_drawdown_period = "N/A"
+    if len(best_df) > 0 and not np.isnan(max_drawdown):
+        dd_series = drawdowns.reset_index(drop=True)
+        nav_series = best_df["净值"].astype(float).reset_index(drop=True)
+        trough_idx = int(dd_series.idxmin())
+        peak_idx = int(nav_series.iloc[: trough_idx + 1].idxmax())
+        peak_ym = str(best_df.iloc[peak_idx]["year_month"]) if "year_month" in best_df.columns else str(peak_idx)
+        trough_ym = str(best_df.iloc[trough_idx]["year_month"]) if "year_month" in best_df.columns else str(trough_idx)
+        max_drawdown_period = f"{peak_ym} -> {trough_ym}"
     ic_mean = df_ic["ic"].mean() if not df_ic.empty else 0
     ic_std = df_ic["ic"].std() if not df_ic.empty else 0
     ric_mean = df_ic["rank_ic"].mean() if not df_ic.empty else 0
     ric_std = df_ic["rank_ic"].std() if not df_ic.empty else 0
     ir = ic_mean / ic_std if ic_std and not np.isnan(ic_std) else 0
     rank_ir = ric_mean / ric_std if ric_std and not np.isnan(ric_std) else 0
+
     overall_grp_ret = df_trades.groupby("group")["actual_ret"].mean()
     overall_monotony, overall_pval = (spearmanr(overall_grp_ret.index, overall_grp_ret.values) if len(overall_grp_ret) > 5 else (0, 0))
+
+    # 业内口径：先按月计算截面单调性，再对时间序列做显著性检验
+    monthly_monotony = []
+    if df_trades is not None and not df_trades.empty and {"year_month", "group", "actual_ret"}.issubset(df_trades.columns):
+        grouped_month = (
+            df_trades.groupby(["year_month", "group"], as_index=False)["actual_ret"]
+            .mean()
+            .sort_values(["year_month", "group"])
+        )
+        for ym, gdf in grouped_month.groupby("year_month"):
+            gser = gdf.set_index("group")["actual_ret"].dropna().sort_index()
+            if len(gser) < 6:
+                continue
+            rho, pval = spearmanr(gser.index.values, gser.values)
+            if np.isfinite(rho):
+                monthly_monotony.append({"year_month": ym, "rho": float(rho), "pval": float(pval)})
+
+    monthly_monotony_df = pd.DataFrame(monthly_monotony)
+    mono_mean_ts = 0.0
+    mono_t_ols = 0.0
+    mono_p_ols = 1.0
+    mono_t_nw = 0.0
+    mono_p_nw = 1.0
+    mono_positive_ratio = 0.0
+    mono_n = 0
+
+    if not monthly_monotony_df.empty:
+        rho_series = monthly_monotony_df["rho"].dropna().astype(float)
+        mono_n = int(len(rho_series))
+        if mono_n > 0:
+            mono_mean_ts = float(rho_series.mean())
+            mono_positive_ratio = float((rho_series > 0).mean())
+            if mono_n >= 3:
+                # 基础 t 检验（均值是否显著偏离 0）
+                try:
+                    t_res = stats.ttest_1samp(rho_series.values, popmean=0.0, nan_policy="omit")
+                    mono_t_ols = float(t_res.statistic) if np.isfinite(t_res.statistic) else 0.0
+                    mono_p_ols = float(t_res.pvalue) if np.isfinite(t_res.pvalue) else 1.0
+                except Exception as e:
+                    logging.getLogger("bt_utils").error(
+                        "单调性t检验失败: %s: %s", type(e).__name__, e
+                    )
+                    mono_t_ols, mono_p_ols = 0.0, 1.0
+
+                # Newey-West(HAC) 稳健检验：OLS(常数项) + HAC 协方差
+                try:
+                    y = rho_series.values
+                    X = np.ones((len(y), 1))
+                    nw_lags = max(1, int(4 * (len(y) / 100.0) ** (2.0 / 9.0)))
+                    nw_lags = min(nw_lags, max(1, len(y) - 1))
+                    nw_model = sm.OLS(y, X).fit(cov_type="HAC", cov_kwds={"maxlags": nw_lags})
+                    mono_t_nw = float(nw_model.tvalues[0]) if np.isfinite(nw_model.tvalues[0]) else 0.0
+                    mono_p_nw = float(nw_model.pvalues[0]) if np.isfinite(nw_model.pvalues[0]) else 1.0
+                except Exception as e:
+                    logging.getLogger("bt_utils").error(
+                        "单调性Newey-West检验失败: %s: %s", type(e).__name__, e
+                    )
+                    mono_t_nw, mono_p_nw = mono_t_ols, mono_p_ols
     best_wins = (best_df["actual_ret"] > best_df["bench_return"]).sum()
     win_rate = best_wins / len(best_df) if len(best_df) > 0 else 0
     calmar = best_ret_ann / abs(max_drawdown) if max_drawdown != 0 else np.nan
@@ -585,47 +728,43 @@ def compute_backtest_kpis(best_df, worst_df, df_trades, df_ic, market_returns, c
         "ic_mean": ic_mean, "ic_std": ic_std, "ric_mean": ric_mean, "ric_std": ric_std,
         "ir": ir, "rank_ir": rank_ir,
         "overall_monotony": overall_monotony, "overall_pval": overall_pval,
-        "win_rate": win_rate, "max_drawdown_period": "N/A", "calmar": calmar
+        "mono_ts_mean": mono_mean_ts,
+        "mono_ts_t_ols": mono_t_ols,
+        "mono_ts_p_ols": mono_p_ols,
+        "mono_ts_t_nw": mono_t_nw,
+        "mono_ts_p_nw": mono_p_nw,
+        "mono_ts_positive_ratio": mono_positive_ratio,
+        "mono_ts_n": mono_n,
+        "win_rate": win_rate, "max_drawdown_period": max_drawdown_period, "calmar": calmar
     }
 
 
-def plot_core_performance(best_df, ls_cum, drawdowns, best_g, html_parts, delay_days=0, factor_name="", strategy_label=None, show_ls=True):
-    if show_ls:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        fig.subplots_adjust(left=0.06, right=0.97, top=0.88, wspace=0.32)
-    else:
-        fig, ax_single = plt.subplots(1, 1, figsize=(10, 5))
-        fig.subplots_adjust(left=0.1, right=0.95, top=0.88)
-        axes = [ax_single, None]
-        
-    _apply_report_caption(fig, factor_name)
-    # --- 左图：策略组合净值 ---
-    ax = axes[0]
-    ts = best_df["year_month"].dt.to_timestamp()
-    label = strategy_label if strategy_label else f"G{best_g} 策略组合"
-    ax.plot(ts, best_df["净值"], color="#16a34a", linewidth=1.6, label=label)
-    if "bench_nav" in best_df.columns:
-        ax.plot(ts, best_df["bench_nav"], color="#94a3b8", linewidth=1.0, linestyle="--", label="基准")
-    ax.set_title(CHART_TITLE_1, loc="center")
-    _style_time_axis(ax, ts, ylabel="净值")
-    ax.yaxis.set_major_formatter(mtick.FormatStrFormatter("%.2f"))
-    _style_legend(ax.legend(loc="upper left", ncol=2))
-    # --- 右图：多空/对冲净值 ---
-    if show_ls:
-        ax2 = axes[1]
-        if ls_cum is not None and len(ls_cum) > 0:
-            if hasattr(ls_cum.index, "to_timestamp"):
-                lt = ls_cum.index.to_timestamp()
-            else:
-                lt = pd.to_datetime(ls_cum.index.astype(str))
-            ax2.plot(lt, ls_cum.values, color="#7c3aed", linewidth=1.6, label="对冲组合/多空净值")
-            ax2.axhline(1.0, color="#94a3b8", linewidth=0.8, linestyle="--")
-        ax2.set_title(CHART_TITLE_2, loc="center")
-        _style_time_axis(ax2, lt if ls_cum is not None and len(ls_cum) > 0 else ts, ylabel="净值")
-        _style_legend(ax2.legend(loc="upper left"))
-    add_plot_to_html(html_parts, fig, "核心绩效指标报告")
+def plot_core_performance(best_df, ls_cum, drawdowns, best_g, html_parts, delay_days=0, factor_name="", strategy_label=None, show_ls=True, df_coverage=None, chart_ctx=None):
+    has_cov = df_coverage is not None and not df_coverage.empty
 
-def plot_pre_post_distribution(df_none, df1, factor_name, html_parts):
+    # 按需求移除图2和图3，避免在报告中展示策略净值与对冲净值曲线。
+    ts = best_df["year_month"].dt.to_timestamp()
+
+    # --- 可选：覆盖度单独保留在图2之后的独立图块（如果有） ---
+    if has_cov:
+        fig_cov, ax3 = plt.subplots(1, 1, figsize=(10.5, 4.8))
+        fig_cov.subplots_adjust(left=0.08, right=0.96, top=0.88)
+        _apply_report_caption(fig_cov, factor_name)
+        cov_df = df_coverage if df_coverage is not None else pd.DataFrame(columns=["year_month", "coverage"])
+        cov_ts = cov_df["year_month"].dt.to_timestamp()
+        cov_vals = cov_df["coverage"].fillna(0)
+        ax3.bar(cov_ts, cov_vals, color="#0ea5e9", width=25, alpha=0.82, zorder=3)
+        avg_cov = cov_vals.mean()
+        ax3.axhline(avg_cov, color="#d97706", linewidth=1.0, linestyle="--",
+                    label=f"均值  {avg_cov*100:.1f}%", zorder=4)
+        ax3.set_title("1.3  因子覆盖度测算走势", loc="center")
+        _style_time_axis(ax3, cov_ts, ylabel="覆盖度频次", percent=True)
+        ax3.xaxis.grid(False)
+        ax3.set_ylim(0, 1.05)
+        _style_legend(ax3.legend(loc="lower right", framealpha=0.92))
+        add_plot_to_html(html_parts, fig_cov, "1.3  因子覆盖度测算走势", chart_ctx=chart_ctx)
+
+def plot_pre_post_distribution(df_none, df1, factor_name, html_parts, chart_ctx=None):
     if df1 is None or factor_name not in df1.columns:
         return
     fig, ax = plt.subplots(figsize=(10, 4))
@@ -636,18 +775,290 @@ def plot_pre_post_distribution(df_none, df1, factor_name, html_parts):
     mean_val = data.mean()
     ax.axvline(mean_val, color="#dc2626", linewidth=1.3, linestyle="--",
                label=f"均值  {mean_val:.4f}")
-    ax.set_title(CHART_TITLE_6, loc="center")
+    ax.set_title("1.2  因子暴露/打分分布", loc="center")
     ax.set_xlabel("因子值")
     ax.set_ylabel("频次")
     ax.set_facecolor("#f5f5f5")
     ax.xaxis.grid(False)
     _style_legend(ax.legend(loc="upper right", framealpha=0.92))
-    add_plot_to_html(html_parts, fig, CHART_TITLE_6)
+    add_plot_to_html(html_parts, fig, "1.2  因子暴露/打分分布", chart_ctx=chart_ctx)
 
-def plot_group_nav(grouped_returns, best_g, worst_g, html_parts, factor_name=""):
+
+def plot_coverage_and_exposure(
+    df_coverage_all,
+    df_coverage_tradeable,
+    df_coverage_all_cs,
+    df_coverage_tradeable_cs,
+    df1,
+    factor_name,
+    html_parts,
+    chart_ctx=None,
+    source_factor_col=None,
+    df1_all=None,
+):
+    """图1恢复旧版分布图；图2使用四子图覆盖度（按原始/最终 × 全样本/可交易）。"""
+
+    df1_all = df1 if df1_all is None else df1_all
+
+    def _pick_col(df, candidates):
+        if df is None:
+            return None
+        for col in candidates:
+            if col and col in df.columns:
+                return col
+        return None
+
+    all_raw_col = _pick_col(df1_all, [source_factor_col, factor_name])
+    all_final_col = _pick_col(
+        df1_all,
+        [
+            f"{source_factor_col}_neu" if source_factor_col else None,
+            f"{factor_name}_neu",
+            factor_name,
+        ],
+    )
+    trade_raw_col = _pick_col(df1, [source_factor_col, factor_name])
+    trade_final_col = _pick_col(
+        df1,
+        [
+            f"{source_factor_col}_neu" if source_factor_col else None,
+            f"{factor_name}_neu",
+            factor_name,
+        ],
+    )
+
+    # 图1：因子分布四子图（原始 -> 3MAD去极值 -> 去极值中性化 -> 去极值中性化标准化）
+    base_df = df1_all if df1_all is not None else df1
+    base_raw_col = _pick_col(base_df, [source_factor_col, factor_name])
+    if base_df is not None and base_raw_col and "year_month" in base_df.columns:
+        dist_df = base_df[["year_month", base_raw_col, "lncap"] + (["industry"] if "industry" in base_df.columns else [])].copy()
+        dist_df.rename(columns={base_raw_col: "raw_factor"}, inplace=True)
+        dist_df["raw_factor"] = pd.to_numeric(dist_df["raw_factor"], errors="coerce")
+
+        raw_series = dist_df["raw_factor"].dropna()
+        raw_median = raw_series.median() if not raw_series.empty else np.nan
+        raw_mad = (raw_series - raw_median).abs().median() if not raw_series.empty else np.nan
+        mad_lower = raw_median - 3.0 * raw_mad if pd.notna(raw_mad) else np.nan
+        mad_upper = raw_median + 3.0 * raw_mad if pd.notna(raw_mad) else np.nan
+
+        def _mad_winsorize_series(s):
+            x = pd.to_numeric(s, errors="coerce")
+            x_valid = x.dropna()
+            if x_valid.empty:
+                return x
+            m = x_valid.median()
+            mad = (x_valid - m).abs().median()
+            if pd.isna(mad) or mad <= 0:
+                return x
+            lo = m - 3.0 * mad
+            hi = m + 3.0 * mad
+            return x.clip(lower=lo, upper=hi)
+
+        dist_df["winsor_factor"] = dist_df.groupby("year_month")["raw_factor"].transform(_mad_winsorize_series)
+
+        neu_col = "winsor_neu_factor"
+        ind_col = "industry" if "industry" in dist_df.columns else None
+        dist_df[neu_col] = neutralize_factor(dist_df, "winsor_factor", mv_col="lncap", ind_col=ind_col)
+        dist_df["winsor_neu_z_factor"] = dist_df.groupby("year_month")[neu_col].transform(
+            lambda s: (s - s.mean()) / s.std() if s.std() and s.std() > 0 else s - s.mean()
+        )
+
+        fig_dist, axes_dist = plt.subplots(2, 2, figsize=(18, 10))
+        fig_dist.subplots_adjust(top=0.88, left=0.05, right=0.98, bottom=0.17, wspace=0.22, hspace=0.34)
+        _apply_report_caption(fig_dist, factor_name)
+
+        panels = [
+            (axes_dist[0, 0], dist_df["raw_factor"], "1.1  原始因子分布", "#3b82f6", True),
+            (axes_dist[0, 1], dist_df["winsor_factor"], "1.2  去极值后因子分布", "#06b6d4", True),
+            (axes_dist[1, 0], dist_df[neu_col], "1.3  去极值中性化处理后因子分布", "#8b5cf6", False),
+            (axes_dist[1, 1], dist_df["winsor_neu_z_factor"], "1.4  去极值中性化标准化因子分布", "#f43f5e", False),
+        ]
+
+        for ax, series, title, color, show_mad in panels:
+            s = pd.to_numeric(series, errors="coerce").dropna()
+            ax.set_facecolor("#f5f5f5")
+            ax.set_title(title, loc="center")
+            ax.set_xlabel("因子值")
+            ax.set_ylabel("频次")
+            ax.xaxis.grid(False)
+            if s.empty:
+                ax.text(0.5, 0.5, "无有效数据", ha="center", va="center", transform=ax.transAxes)
+                continue
+            ax.hist(s, bins=60, color=color, edgecolor="white", linewidth=0.25, alpha=0.88, label="样本分布")
+            mu = s.mean()
+            sd = s.std()
+            ax.axvline(mu, color="#dc2626", linewidth=1.1, linestyle="--", label=f"均值 {mu:.4f}")
+            if show_mad and pd.notna(mad_lower) and pd.notna(mad_upper):
+                ax.axvline(mad_lower, color="#f59e0b", linewidth=1.1, linestyle=":", label=f"3MAD下界 {mad_lower:.4f}")
+                ax.axvline(mad_upper, color="#f59e0b", linewidth=1.1, linestyle=":", label=f"3MAD上界 {mad_upper:.4f}")
+            ax.text(
+                0.02,
+                0.95,
+                f"样本数={len(s):,}  标准差={sd:.4f}",
+                transform=ax.transAxes,
+                ha="left",
+                va="top",
+                fontsize=8.5,
+                color="#475569",
+                bbox=dict(boxstyle="round,pad=0.26", facecolor="white", edgecolor="#cbd5e1", alpha=0.95),
+            )
+            _style_legend(ax.legend(loc="upper right", framealpha=0.92))
+
+        fig_dist.text(
+            0.05,
+            0.04,
+            "说明: 处理流程为 原始 -> 3MAD去极值 -> 行业+市值中性化 -> 截面标准化；1.1/1.2 已恢复 3MAD 垂直参考线。",
+            fontsize=9,
+            ha="left",
+            va="bottom",
+            color="#334155",
+        )
+        add_plot_to_html(html_parts, fig_dist, CHART_TITLE_1, chart_ctx=chart_ctx)
+
+    def _normalize_month_cov(df_cov):
+        if df_cov is None or df_cov.empty or "year_month" not in df_cov.columns:
+            return None
+        cov = df_cov.copy()
+        cov["year_month"] = pd.PeriodIndex(cov["year_month"].astype(str), freq="M")
+        if "coverage" not in cov.columns:
+            denom_col = None
+            for col in ["stock_pool_count", "candidate_count", "market_count"]:
+                if col in cov.columns:
+                    denom_col = col
+                    break
+            if denom_col and "factor_count" in cov.columns:
+                cov["coverage"] = np.where(
+                    pd.to_numeric(cov[denom_col], errors="coerce") > 0,
+                    pd.to_numeric(cov["factor_count"], errors="coerce") / pd.to_numeric(cov[denom_col], errors="coerce"),
+                    np.nan,
+                )
+        cov["coverage"] = pd.to_numeric(cov["coverage"], errors="coerce")
+        return cov[["year_month", "coverage"]]
+
+    def _normalize_cs_cov(df_cov):
+        if df_cov is None or df_cov.empty or "date" not in df_cov.columns:
+            return None
+        cov = df_cov.copy()
+        cov["date"] = pd.to_datetime(cov["date"], errors="coerce")
+        cov = cov.dropna(subset=["date"])
+        if "coverage" not in cov.columns:
+            denom_col = None
+            for col in ["stock_pool_count", "candidate_count", "market_count"]:
+                if col in cov.columns:
+                    denom_col = col
+                    break
+            if denom_col and "factor_count" in cov.columns:
+                cov["coverage"] = np.where(
+                    pd.to_numeric(cov[denom_col], errors="coerce") > 0,
+                    pd.to_numeric(cov["factor_count"], errors="coerce") / pd.to_numeric(cov[denom_col], errors="coerce"),
+                    np.nan,
+                )
+        cov["coverage"] = pd.to_numeric(cov["coverage"], errors="coerce")
+        return cov[["date", "coverage"]].sort_values("date")
+
+    cov_all_month = _normalize_month_cov(df_coverage_all)
+    cov_trade_month = _normalize_month_cov(df_coverage_tradeable)
+    cov_all_cs = _normalize_cs_cov(df_coverage_all_cs)
+    cov_trade_cs = _normalize_cs_cov(df_coverage_tradeable_cs)
+
+    def _plot_cov_month(ax, cov_df, title, color, extra_text):
+        ax.set_facecolor("#f5f5f5")
+        if cov_df is None or cov_df.empty:
+            ax.text(0.5, 0.5, "无覆盖度数据", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(title, loc="center")
+            return
+        ts = cov_df["year_month"].dt.to_timestamp()
+        vals = cov_df["coverage"].fillna(0)
+        ax.bar(ts, vals, color=color, width=25, alpha=0.82, zorder=3)
+        avg_cov = vals.mean()
+        ax.axhline(avg_cov, color="#d97706", linewidth=1.0, linestyle="--", label=f"均值  {avg_cov*100:.1f}%", zorder=4)
+        _style_time_axis(ax, ts, ylabel="覆盖度", percent=True)
+        ax.xaxis.grid(False)
+        ax.set_ylim(0, 1.05)
+        ax.set_title(title, loc="center")
+        ax.text(
+            0.02,
+            0.95,
+            extra_text,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.5,
+            color="#475569",
+            bbox=dict(boxstyle="round,pad=0.26", facecolor="white", edgecolor="#cbd5e1", alpha=0.95),
+        )
+        _style_legend(ax.legend(loc="lower right", framealpha=0.92))
+
+    def _plot_cov_cs(ax, cov_df, title, color, extra_text):
+        ax.set_facecolor("#f5f5f5")
+        if cov_df is None or cov_df.empty:
+            ax.text(0.5, 0.5, "无覆盖度数据", ha="center", va="center", transform=ax.transAxes)
+            ax.set_title(title, loc="center")
+            return
+        ts = cov_df["date"]
+        vals = cov_df["coverage"].fillna(0)
+        ax.plot(ts, vals, color=color, linewidth=1.0, alpha=0.9, label="截面覆盖度")
+        avg_cov = vals.mean()
+        ax.axhline(avg_cov, color="#d97706", linewidth=1.0, linestyle="--", label=f"均值  {avg_cov*100:.1f}%", zorder=4)
+        _style_time_axis(ax, ts, ylabel="覆盖度", percent=True)
+        ax.xaxis.grid(False)
+        ax.set_ylim(0, 1.05)
+        ax.set_title(title, loc="center")
+        ax.text(
+            0.02,
+            0.95,
+            extra_text,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8.5,
+            color="#475569",
+            bbox=dict(boxstyle="round,pad=0.26", facecolor="white", edgecolor="#cbd5e1", alpha=0.95),
+        )
+        _style_legend(ax.legend(loc="lower right", framealpha=0.92))
+
+    # 图2：覆盖度四子图（沿用“当前因子分布”的四维逻辑）
+    fig_cov, axes_cov = plt.subplots(2, 2, figsize=(18, 10))
+    fig_cov.subplots_adjust(top=0.88, left=0.05, right=0.98, bottom=0.18, wspace=0.22, hspace=0.34)
+    _apply_report_caption(fig_cov, factor_name)
+
+    _plot_cov_month(
+        axes_cov[0, 0],
+        cov_all_month,
+        "2.1  月度全市场覆盖度",
+        "#3b82f6",
+        "月度口径：N=月内 factor_count 累加，D=月内 market_count 累加，C=N/D。",
+    )
+    _plot_cov_cs(
+        axes_cov[0, 1],
+        cov_all_cs,
+        "2.2  交易截面全市场覆盖度",
+        "#06b6d4",
+        "日截面口径：N=factor_count，D=market_count，C=N/D。",
+    )
+    _plot_cov_month(
+        axes_cov[1, 0],
+        cov_trade_month,
+        "2.3  月度股票池覆盖度",
+        "#8b5cf6",
+        "股票池月度口径：N=月内 factor_count 累加，D=月内 market_count 累加。",
+    )
+    _plot_cov_cs(
+        axes_cov[1, 1],
+        cov_trade_cs,
+        "2.4  交易截面股票池覆盖度",
+        "#f43f5e",
+        "股票池日截面口径：N=factor_count，D=market_count，C=N/D。",
+    )
+    add_plot_to_html(html_parts, fig_cov, CHART_TITLE_1_COV, chart_ctx=chart_ctx)
+
+def plot_group_nav(grouped_returns, best_g, worst_g, html_parts, factor_name="", chart_ctx=None):
+    if grouped_returns is None or grouped_returns.empty:
+        return
     groups = sorted(grouped_returns["group"].unique())
     n = len(groups)
-    cmap = plt.cm.RdYlGn
+    cmap = plt.get_cmap("RdYlGn")
+    x_axis = grouped_returns["year_month"].dt.to_timestamp()
     fig, ax = plt.subplots(figsize=(14, 6))
     fig.subplots_adjust(top=0.88, left=0.06, right=0.97)
     _apply_report_caption(fig, factor_name)
@@ -671,20 +1082,105 @@ def plot_group_nav(grouped_returns, best_g, worst_g, html_parts, factor_name="")
             ls = "--"
             zord = 2
         ax.plot(x, y, color=color, linewidth=lw, linestyle=ls, zorder=zord, label=f"G{g}")
-    ax.set_title(CHART_TITLE_3, loc="center")
-    _style_time_axis(ax, x, ylabel="净值")
+    ax.set_title(CHART_TITLE_4, loc="center")
+    _style_time_axis(ax, x_axis, ylabel="净值")
     ax.yaxis.set_major_formatter(mtick.FormatStrFormatter("%.1f"))
     _style_legend(ax.legend(
         ncol=5, loc="upper left",
         framealpha=0.92, edgecolor="#d1d9e6",
         fontsize=9, handlelength=1.8, columnspacing=1.2,
     ))
-    add_plot_to_html(html_parts, fig, CHART_TITLE_3)
+    add_plot_to_html(html_parts, fig, CHART_TITLE_4, chart_ctx=chart_ctx)
+
+
+def build_group_nav_echarts_block(grouped_returns, best_g=None, worst_g=None, title="4.  因子分组分层测试（交互）"):
+    """生成可交互的分组净值 ECharts 图块。"""
+    if grouped_returns is None or grouped_returns.empty:
+        return ""
+
+    gdf = grouped_returns.copy()
+    if "year_month" not in gdf.columns or "group" not in gdf.columns or "净值" not in gdf.columns:
+        return ""
+
+    gdf["ym"] = gdf["year_month"].astype(str)
+    pivot = gdf.pivot_table(index="ym", columns="group", values="净值", aggfunc="last").sort_index()
+    if pivot.empty:
+        return ""
+
+    pivot_cols = sorted([c for c in pivot.columns if pd.notna(c)])
+    x_data = pivot.index.tolist()
+    series = []
+    for g in pivot_cols:
+        try:
+            g_name = f"G{int(g)}"
+        except Exception:
+            g_name = f"G{g}"
+        vals = pivot[g].astype(float).round(6).tolist()
+        series.append(
+            {
+                "name": g_name,
+                "type": "line",
+                "showSymbol": False,
+                "smooth": True,
+                "lineStyle": {"width": 2.2 if g in [best_g, worst_g] else 1.3},
+                "data": vals,
+            }
+        )
+
+    chart_id = f"group_nav_chart_{abs(hash(tuple(x_data))) % 10000000}"
+    payload = {"x": x_data, "series": series}
+
+    return f"""
+<div class='echarts-wrap'>
+  <h4>{title}</h4>
+  <div id='{chart_id}' class='echarts-canvas'></div>
+  <script>
+    (function() {{
+      const payload = {json.dumps(payload, ensure_ascii=False)};
+      const el = document.getElementById('{chart_id}');
+      if (!el || typeof echarts === 'undefined') return;
+      const chart = echarts.init(el);
+            if (!window.__reportCharts) window.__reportCharts = [];
+            window.__reportCharts.push(chart);
+      chart.setOption({{
+        tooltip: {{ trigger: 'axis' }},
+        legend: {{ top: 4 }},
+        grid: {{ left: 54, right: 20, top: 42, bottom: 48 }},
+        dataZoom: [
+          {{ type: 'inside', start: 0, end: 100 }},
+          {{ type: 'slider', bottom: 10, start: 0, end: 100 }}
+        ],
+        xAxis: {{ type: 'category', data: payload.x, axisLabel: {{ color: '#475569' }} }},
+        yAxis: {{ type: 'value', axisLabel: {{ color: '#475569' }} }},
+        series: payload.series
+      }});
+            setTimeout(function() {{ chart.resize(); }}, 100);
+      window.addEventListener('resize', function() {{ chart.resize(); }});
+    }})();
+  </script>
+</div>
+"""
+
+
+def save_group_nav_csv(out_dir, grouped_returns, factor_name):
+    """导出分组净值透视表，方便学习图表渲染数据结构。"""
+    if grouped_returns is None or grouped_returns.empty:
+        return None
+    gdf = grouped_returns.copy()
+    if "year_month" not in gdf.columns or "group" not in gdf.columns or "净值" not in gdf.columns:
+        return None
+    gdf["year_month"] = gdf["year_month"].astype(str)
+    wide = gdf.pivot_table(index="year_month", columns="group", values="净值", aggfunc="last").sort_index()
+    wide.columns = [f"G{int(c)}" if pd.notna(c) else str(c) for c in wide.columns]
+    wide = wide.reset_index().rename(columns={"year_month": "date"})
+    out_path = os.path.join(out_dir, f"{factor_name}_group_nav_curve.csv")
+    wide.to_csv(out_path, index=False, encoding="utf-8-sig")
+    return out_path
 
 def plot_extreme_groups(best_df, worst_df, best_g, worst_g, html_parts):
     pass # covered by others
 
-def plot_monotonicity_bar(grouped_returns, market_returns, overall_monotony, overall_pval, html_parts, factor_name=""):
+def plot_monotonicity_bar(grouped_returns, market_returns, overall_monotony, overall_pval, html_parts, factor_name="", chart_ctx=None, mono_ts_mean=0.0, mono_ts_t_nw=0.0, mono_ts_p_nw=1.0, mono_ts_positive_ratio=0.0, mono_ts_n=0):
     groups = sorted(grouped_returns["group"].unique())
     grp_abs = grouped_returns.groupby("group")["actual_ret"].mean().reindex(groups)
     # 计算相对市场超额收益
@@ -697,10 +1193,11 @@ def plot_monotonicity_bar(grouped_returns, market_returns, overall_monotony, ove
         grp_exc = merged.groupby("group")["_exc"].mean().reindex(groups)
     else:
         grp_exc = grp_abs - grp_abs.mean()
-    x = np.arange(len(groups))
+    x = np.arange(len(groups), dtype=float)
     w = 0.38
     fig, ax = plt.subplots(figsize=(12, 5))
-    fig.subplots_adjust(top=0.88, left=0.08, right=0.97)
+    # 在底部预留说明文字区域
+    fig.subplots_adjust(top=0.88, left=0.08, right=0.97, bottom=0.23)
     _apply_report_caption(fig, factor_name)
     ax.bar(x - w / 2, grp_abs.values, width=w, color=_BAR_ABS_COLOR,
            label="平均月绝对收益", edgecolor="white", linewidth=0.5, zorder=3)
@@ -710,25 +1207,36 @@ def plot_monotonicity_bar(grouped_returns, market_returns, overall_monotony, ove
     ax.set_facecolor("#f5f5f5")
     ax.set_xticks(x)
     ax.set_xticklabels([f"G{g}" for g in groups])
-    ax.set_title(CHART_TITLE_5, loc="center")
+    ax.set_title(CHART_TITLE_6, loc="center")
     ax.set_ylabel("月均收益")
     ax.yaxis.set_major_formatter(mtick.FuncFormatter(lambda v, _: f"{v*100:.2f}%"))
     ax.xaxis.grid(False)
     pval_str = f"{overall_pval:.4e}" if overall_pval != 0 and abs(overall_pval) < 0.001 else f"{overall_pval:.4f}"
-    stats_text = f"Spearman Monotony:  {overall_monotony:.4f}\nP-value:  {pval_str}"
-    ax.text(0.02, 0.97, stats_text, transform=ax.transAxes, fontsize=9,
-            verticalalignment="top",
-            bbox=dict(boxstyle="round,pad=0.45", facecolor="white", edgecolor="#c7d2dc", alpha=0.95))
+    pval_nw_str = f"{mono_ts_p_nw:.4e}" if mono_ts_p_nw != 0 and abs(mono_ts_p_nw) < 0.001 else f"{mono_ts_p_nw:.4f}"
+    stats_text = (
+        f"Legacy Spearman:  {overall_monotony:.4f}  (p={pval_str})\n"
+        f"TS Mean Spearman: {mono_ts_mean:.4f}  (N={mono_ts_n}, pos={mono_ts_positive_ratio:.1%})\n"
+        f"NW t-stat / p-value: {mono_ts_t_nw:.3f} / {pval_nw_str}"
+    )
+    fig.text(
+        0.08,
+        0.04,
+        f"说明: {stats_text.replace(chr(10), ' | ')}",
+        fontsize=9,
+        ha="left",
+        va="bottom",
+        color="#334155",
+    )
     _style_legend(ax.legend(loc="upper right", framealpha=0.92, edgecolor="#d1d9e6"))
-    add_plot_to_html(html_parts, fig, CHART_TITLE_5)
+    add_plot_to_html(html_parts, fig, CHART_TITLE_6, chart_ctx=chart_ctx)
 
-def plot_ic_trend(df_ic, html_parts, rank=False, factor_name="", combined=False):
+def plot_ic_trend(df_ic, html_parts, rank=False, factor_name="", combined=False, chart_ctx=None):
     if df_ic is None or df_ic.empty:
         return
     if combined:
         # 合并 IC 和 Rank IC 成双列子图
         fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-        fig.subplots_adjust(left=0.06, right=0.97, top=0.88, wspace=0.32)
+        fig.subplots_adjust(left=0.06, right=0.97, top=0.88, bottom=0.24, wspace=0.32)
         _apply_report_caption(fig, factor_name)
         for ax_i, (col, lbl, num, pos_c) in enumerate([
             ("ic", "IC", "4a", "#3b82f6"),
@@ -743,24 +1251,40 @@ def plot_ic_trend(df_ic, html_parts, rank=False, factor_name="", combined=False)
             bar_colors = [pos_c if v >= 0 else "#ef4444" for v in vals]
             ax.bar(ts, vals, color=bar_colors, width=25, alpha=0.82, zorder=3)
             roll = pd.Series(vals.values).rolling(window=6, min_periods=1).mean()
-            ax.plot(ts, roll.values, color="#1e293b", linewidth=1.2, label="6期滚动均值", zorder=4)
+            ax.plot(ts, np.asarray(roll.values, dtype=float), color="#1e293b", linewidth=1.2, label="6期滚动均值", zorder=4)
             ax.axhline(0, color="#94a3b8", linewidth=0.7, zorder=2)
             nz = vals[vals != 0]
             mean_v = nz.mean() if len(nz) > 0 else 0
             ax.axhline(mean_v, color="#d97706", linewidth=1.0, linestyle="--",
                        label=f"均值  {mean_v:.4f}", zorder=4)
-            ax.set_title("4.1  Pearson IC 测算走势" if ax_i == 0 else "4.2  Rank IC 测算走势", loc="center")
+            ax.set_title("5.1  Pearson IC 测算走势" if ax_i == 0 else "5.2  Rank IC 测算走势", loc="center")
             _style_time_axis(ax, ts, ylabel=lbl)
             ax.xaxis.grid(False)
             _style_legend(ax.legend(loc="upper right", fontsize=8, framealpha=0.92))
-        add_plot_to_html(html_parts, fig, CHART_TITLE_4)
+
+            total_n = len(vals)
+            if total_n > 0:
+                pos_ratio = (vals > 0).sum() / total_n
+                neg_ratio = (vals < 0).sum() / total_n
+                ax.text(
+                    0.5,
+                    -0.24,
+                    f"正值占比: {pos_ratio:.2%}   负值占比: {neg_ratio:.2%}   (总期数={total_n})",
+                    transform=ax.transAxes,
+                    ha="center",
+                    va="top",
+                    fontsize=9,
+                    color="#475569",
+                    clip_on=False,
+                )
+        add_plot_to_html(html_parts, fig, CHART_TITLE_5, chart_ctx=chart_ctx)
     else:
         # 单图模式（向后兼容）
         y_col = "rank_ic" if rank else "ic"
         if y_col not in df_ic.columns:
             return
         fig, ax = plt.subplots(figsize=(12, 4))
-        fig.subplots_adjust(top=0.88)
+        fig.subplots_adjust(top=0.88, bottom=0.24)
         _apply_report_caption(fig, factor_name)
         ts = df_ic["year_month"].dt.to_timestamp()
         vals = df_ic[y_col].fillna(0)
@@ -768,14 +1292,30 @@ def plot_ic_trend(df_ic, html_parts, rank=False, factor_name="", combined=False)
         ax.bar(ts, vals, color=[pos_c if v >= 0 else "#ef4444" for v in vals],
                width=25, alpha=0.82, zorder=3)
         roll = pd.Series(vals.values).rolling(window=6, min_periods=1).mean()
-        ax.plot(ts, roll.values, color="#1e293b", linewidth=1.2, label="6期滚动均值", zorder=4)
+        ax.plot(ts, np.asarray(roll.values, dtype=float), color="#1e293b", linewidth=1.2, label="6期滚动均值", zorder=4)
         ax.axhline(0, color="#94a3b8", linewidth=0.7, zorder=2)
         lbl = "Rank IC" if rank else "IC"
-        ax.set_title(CHART_TITLE_4 if not rank else "4.2  Rank IC 测算走势", loc="center")
+        ax.set_title(CHART_TITLE_5 if not rank else "5.2  Rank IC 测算走势", loc="center")
         _style_time_axis(ax, ts, ylabel=lbl)
         ax.xaxis.grid(False)
         _style_legend(ax.legend(loc="upper right", framealpha=0.92))
-        add_plot_to_html(html_parts, fig, f"4.  {lbl} 时序走势")
+
+        total_n = len(vals)
+        if total_n > 0:
+            pos_ratio = (vals > 0).sum() / total_n
+            neg_ratio = (vals < 0).sum() / total_n
+            ax.text(
+                0.5,
+                -0.24,
+                f"正值占比: {pos_ratio:.2%}   负值占比: {neg_ratio:.2%}   (总期数={total_n})",
+                transform=ax.transAxes,
+                ha="center",
+                va="top",
+                fontsize=9,
+                color="#475569",
+                clip_on=False,
+            )
+        add_plot_to_html(html_parts, fig, f"5.  {lbl} 时序走势", chart_ctx=chart_ctx)
 
 def plot_ir_rank_ir_bar(df_ic, html_parts):
     pass
@@ -783,7 +1323,7 @@ def plot_ir_rank_ir_bar(df_ic, html_parts):
 def plot_group_win_rates(df_trades, market_returns, html_parts):
     pass
 
-def plot_daily_nav(daily_portfolio_df, html_parts):
+def plot_daily_nav(daily_portfolio_df, html_parts, chart_ctx=None):
     if daily_portfolio_df is not None and not daily_portfolio_df.empty:
         fig, ax = plt.subplots(figsize=(12, 4.6))
         fig.subplots_adjust(left=0.07, right=0.97, top=0.90)
@@ -792,7 +1332,7 @@ def plot_daily_nav(daily_portfolio_df, html_parts):
         _style_time_axis(ax, ts, ylabel="净值")
         ax.set_title(CHART_TITLE_DAILY, loc="center")
         _style_legend(ax.legend(loc="upper left"))
-        add_plot_to_html(html_parts, fig, CHART_TITLE_DAILY)
+        add_plot_to_html(html_parts, fig, CHART_TITLE_DAILY, chart_ctx=chart_ctx)
 
 def build_strategy_context(test_name, start_month, end_month, benchmark, factor_cols):
     cols_str = ", ".join(factor_cols) if factor_cols else "N/A"
@@ -868,19 +1408,63 @@ def generate_all_charts(
     kpis,
     out_dir,
     delay_days=0,
-    df_coverage=None,
+    df_coverage_all=None,
+    df_coverage_tradeable=None,
+    df_coverage_all_cs=None,
+    df_coverage_tradeable_cs=None,
+    df1_all=None,
+    source_factor_col=None,
 ):
     # 收益概况页：图表优先
+    chart_ctx = ReportChartContext(out_dir)
     summary_blocks = []
-    # 按顺序 1→2→3→4→5→6→7 生成各图表
-    plot_core_performance(best_df, kpis.get("ls_cum"), kpis.get("drawdowns"), best_g, summary_blocks, delay_days=delay_days, factor_name=factor_name)
-    plot_group_nav(grouped_returns, best_g, worst_g, summary_blocks, factor_name=factor_name)
-    plot_ic_trend(df_ic, summary_blocks, combined=True, factor_name=factor_name)
-    plot_monotonicity_bar(grouped_returns, market_returns, kpis.get("overall_monotony", 0), kpis.get("overall_pval", 0), summary_blocks, factor_name=factor_name)
-    plot_pre_post_distribution(None, df1, factor_name, summary_blocks)
-    
-    # 插入新的因子覆盖度走势图
-    plot_factor_coverage(df_coverage, summary_blocks, factor_name=factor_name)
+    # 1) 第1块：因子覆盖度 + 因子暴露
+    plot_coverage_and_exposure(
+        df_coverage_all,
+        df_coverage_tradeable,
+        df_coverage_all_cs,
+        df_coverage_tradeable_cs,
+        df1,
+        factor_name,
+        summary_blocks,
+        chart_ctx=chart_ctx,
+        df1_all=df1_all,
+        source_factor_col=source_factor_col,
+    )
+
+    # 2) 第2块：核心绩效（净值与对冲）
+    plot_core_performance(
+        best_df,
+        kpis.get("ls_cum"),
+        kpis.get("drawdowns"),
+        best_g,
+        summary_blocks,
+        delay_days=delay_days,
+        factor_name=factor_name,
+        df_coverage=None,
+        chart_ctx=chart_ctx,
+    )
+
+    # 3+) 后续图顺延
+    interactive_group_nav_html = build_group_nav_echarts_block(grouped_returns, best_g=best_g, worst_g=worst_g)
+    if interactive_group_nav_html:
+        summary_blocks.append(interactive_group_nav_html)
+
+    plot_ic_trend(df_ic, summary_blocks, combined=True, factor_name=factor_name, chart_ctx=chart_ctx)
+    plot_monotonicity_bar(
+        grouped_returns,
+        market_returns,
+        kpis.get("overall_monotony", 0),
+        kpis.get("overall_pval", 0),
+        summary_blocks,
+        factor_name=factor_name,
+        chart_ctx=chart_ctx,
+        mono_ts_mean=kpis.get("mono_ts_mean", 0),
+        mono_ts_t_nw=kpis.get("mono_ts_t_nw", 0),
+        mono_ts_p_nw=kpis.get("mono_ts_p_nw", 1),
+        mono_ts_positive_ratio=kpis.get("mono_ts_positive_ratio", 0),
+        mono_ts_n=kpis.get("mono_ts_n", 0),
+    )
 
     summary_html = "".join(summary_blocks)
     html_parts.append(
@@ -892,65 +1476,7 @@ def generate_all_charts(
         )
     )
 
-    # 交易详情页：分组收益与交易样本表
-    trade_blocks = []
-    grouped_table = grouped_returns.copy()
-    if "year_month" in grouped_table.columns:
-        grouped_table["year_month"] = grouped_table["year_month"].astype(str)
-    add_table_to_html(trade_blocks, grouped_table, "分组月度收益与净值", max_rows=200)
-
-    trades_table = df_trades.copy()
-    if "year_month" in trades_table.columns:
-        trades_table["year_month"] = trades_table["year_month"].astype(str)
-    add_table_to_html(trade_blocks, trades_table, "交易明细样本", max_rows=200)
-
-    html_parts.append(
-        build_section(
-            title="交易详情",
-            content_html="".join(trade_blocks),
-            desc="分层收益与逐笔交易样本",
-            tab_id="tab-trades",
-        )
-    )
-
-    # 每日持仓和收益页：市场组合及 IC 数据
-    daily_blocks = []
-    market_table = market_returns.copy()
-    if "year_month" in market_table.columns:
-        market_table["year_month"] = market_table["year_month"].astype(str)
-    add_table_to_html(daily_blocks, market_table, "市场组合月度收益", max_rows=200)
-
-    ic_table = df_ic.copy()
-    if not ic_table.empty and "year_month" in ic_table.columns:
-        ic_table["year_month"] = ic_table["year_month"].astype(str)
-    add_table_to_html(daily_blocks, ic_table, "IC / RankIC 序列", max_rows=240)
-
-    html_parts.append(
-        build_section(
-            title="每日持仓和收益",
-            content_html="".join(daily_blocks),
-            desc="日频/序列指标汇总",
-            tab_id="tab-daily",
-        )
-    )
-
-    # 日志页
-    log_blocks = []
-    add_log_block(
-        log_blocks,
-        f"因子: {factor_name}\n最优组: G{best_g}, 最差组: G{worst_g}\n"
-        f"IC={kpis.get('ic_mean', 0):.4f}, IR={kpis.get('ir', 0):.4f}, "
-        f"RankIC={kpis.get('ric_mean', 0):.4f}, RankIR={kpis.get('rank_ir', 0):.4f}\n"
-        f"Sharpe={kpis.get('sharpe', 0):.4f}, Calmar={kpis.get('calmar', 0):.4f}",
-        title="回测摘要日志",
-    )
-    html_parts.append(
-        build_section(
-            title="输出日志",
-            content_html="".join(log_blocks),
-            desc="运行摘要与关键指标日志",
-            tab_id="tab-logs",
-        )
-    )
-
-    return save_extreme_groups_csv(out_dir, best_df, worst_df, best_g, worst_g, factor_name)
+    # 当前模式：只保留收益概况，不追加交易详情/每日表现/运行日志章节。
+    save_group_nav_csv(out_dir, grouped_returns, factor_name)
+    # 不需要生成极值分组月度对比CSV，已有各分组净值曲线
+    # return save_extreme_groups_csv(out_dir, best_df, worst_df, best_g, worst_g, factor_name)
