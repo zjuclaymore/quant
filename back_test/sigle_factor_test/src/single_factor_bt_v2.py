@@ -52,7 +52,6 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         out_dir: str,
         st_df: pd.DataFrame = None,
         ind_df: pd.DataFrame = None,
-        index_daily_dir: str = None,
         delay_days: int = 0,
         rebalance_month_start: bool = False,
     ):
@@ -85,9 +84,7 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         os.makedirs(out_dir, exist_ok=True)
         self.delay_days = int(delay_days)
         self.rebalance_month_start = bool(rebalance_month_start)
-
-        self.index_daily_dir = index_daily_dir
-        self.bench_cache = {}
+        # 基准指数已移除，不再维护 index_daily_dir 和 bench_cache
 
         self._setup_logger()
         self.logger.info("=== SingleFactorBacktesterV2 (V2.5) 初始化 ===")
@@ -573,93 +570,5 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
         ]
 
 
-    def _load_benchmark_returns(self, benchmark_symbol, start_month, end_month, cal):
-        """
-        推演基准指数的月度收益序列 (Benchmark Performance Derivation)
-
-        逻辑流程:
-            1. 缓存优先: 优先从 `self.bench_cache` 检索已读取的收盘价。
-            2. 物理读取: 扫描 `index_daily_dir` 下的 pickle 资产，定位基准指数代码。
-            3. 收益折算: 根据调仓日历的 `buy_date` 和 `sell_date` 计算基准的区间回报率。
-            4. 复归处理: 若调仓日无数据，自动向前向后搜索最近的有效收盘价进行估算。
-
-        返回:
-            pd.DataFrame: 包含各调仓期基准收益的序列。
-        """
-        if self.index_daily_dir is None or not os.path.isdir(self.index_daily_dir):
-            msg = f"未提供有效基准指数目录: {self.index_daily_dir}"
-            self.logger.error(msg)
-            raise FileNotFoundError(msg)
-
-        self.logger.info(f"从本地加载基准指数 {benchmark_symbol} ...")
-
-        # 收集需要的日期
-        needed_dates = set()
-        for _, row in cal.iterrows():
-            needed_dates.add(row["buy_date"])
-            needed_dates.add(row["sell_date"])
-
-        # 加载对应日期的指数数据
-        bench_prices = {}
-        for d in sorted(needed_dates):
-            if d in self.bench_cache:
-                bench_prices[d] = self.bench_cache[d]
-                continue
-
-            date_str = d.strftime("%Y%m%d")
-            fpath = os.path.join(self.index_daily_dir, f"{date_str}.pickle")
-            if not os.path.exists(fpath):
-                continue
-            try:
-                df_idx = pd.read_pickle(fpath)
-                code_col = None
-                for c in df_idx.columns:
-                    if "Wind" in c or "code" in c.lower():
-                        code_col = c
-                        break
-                if code_col is None:
-                    code_col = df_idx.columns[1]
-
-                close_col = None
-                for c in df_idx.columns:
-                    if "收盘" in c:
-                        close_col = c
-                        break
-
-                if close_col:
-                    row_match = df_idx[df_idx[code_col] == benchmark_symbol]
-                    if not row_match.empty:
-                        val = float(row_match.iloc[0][close_col])
-                        bench_prices[d] = val
-                        self.bench_cache[d] = val
-            except Exception as e:
-                self.logger.debug(f"读取基准指数 {date_str} 异常: {e}")
-
-        if not bench_prices:
-            msg = f"未能加载任何基准指数 {benchmark_symbol} 数据"
-            self.logger.error(msg)
-            raise ValueError(msg)
-
-        bench_series = pd.Series(bench_prices).sort_index()
-
-        b_rets = []
-        for _, row in cal.iterrows():
-            ym = row["year_month"]
-            buy_d = row["buy_date"]
-            sell_d = row["sell_date"]
-
-            p_b = bench_series.get(buy_d, np.nan)
-            p_s = bench_series.get(sell_d, np.nan)
-
-            if np.isnan(p_b):
-                prior = bench_series[bench_series.index <= buy_d]
-                p_b = prior.iloc[-1] if len(prior) > 0 else np.nan
-            if np.isnan(p_s):
-                prior = bench_series[bench_series.index <= sell_d]
-                p_s = prior.iloc[-1] if len(prior) > 0 else np.nan
-
-            if not np.isnan(p_b) and not np.isnan(p_s) and p_b > 0:
-                b_rets.append({"year_month": ym, "bench_return": p_s / p_b - 1})
-
-        self.logger.info(f"基准指数月度收益计算完成: {len(b_rets)} 期")
-        return pd.DataFrame(b_rets)
+    # _load_benchmark_returns 已移除：内部基准不再需要加载指数数据。
+    # 收益对齐由 BacktestCoreMixin._align_benchmark 以 bench_return=0 展开。

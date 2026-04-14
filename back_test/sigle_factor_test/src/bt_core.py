@@ -106,12 +106,11 @@ class BacktestCoreMixin:
         mv_df: pd.DataFrame = None,
         commission=0,
         direction="auto",
-        benchmark_symbol="000905.SH",
         group_size: int = 0,
         top_n_per_group: int = 0,
         enable_neutralization: bool = True,
         mad_clip_only: bool = False,
-        rebalance_month_end_close: bool = False,
+        rebalance_month_end_close: bool = True,
     ):
         """
         执行单因子回测主执行器 (The Main Backtest Runner)
@@ -336,11 +335,10 @@ class BacktestCoreMixin:
         worst_df = grouped_returns[grouped_returns["group"] == worst_g].copy()
 
         # ============ 8. 基准对齐 ============
-        df_bench_m = self._load_benchmark_returns(
-            benchmark_symbol, start_month, end_month, cal
-        )
-        best_df = self._align_benchmark(best_df, df_bench_m)
-        worst_df = self._align_benchmark(worst_df, df_bench_m)
+        # 已移除外部基准指数：使用 bench_return=0 展开超额收益。
+        # 此时 excess_ret = actual_ret，win_rate = 正收益月份比例。
+        best_df = self._align_benchmark(best_df)
+        worst_df = self._align_benchmark(worst_df)
 
         # ============ 9. 计算 KPI ============
         df_ic = pd.DataFrame(ic_records)
@@ -837,20 +835,31 @@ class BacktestCoreMixin:
         """
         计算单期信息系数 (Information Coefficient)
 
-        衡量因子得分对未来一段时期收益率的预测能力。
-        - Pearson IC: 原始值的线性相关性。
-        - Spearman Rank IC: 排名值的秩相关性，对离群值更鲁棒。
+        计算对象说明:
+            - 因子列: target_factor（经中性化/标准化后的因子分，与分组依据一致）
+            - 收益列: actual_ret（后复权收盘价计算，已承活手续费）
+            - 样本集: trade2 = 实际已成交的股票子集（Realized IC）
 
-        调用示例:
-            >>> ic_results = self._compute_period_ic(trade_df, "alpha_factor", pd.Period("2023-01"))
+        公式:
+            Pearson IC   = Pearsonr(factor_score, actual_return)
+            Rank IC      = Spearmanr(rank(factor_score), rank(actual_return))
+
+        设计选择 — 为什么用 trade2 而非全信号池:
+            trade2 已经通过流动性、涨停、ST 等实盘可交易筛选，
+            反映的是策略实际可获展敢的收益，与分组回测口径完全一致。
+
+        已知局限 (IC轻微低估风险):
+            一字涨停日无法开仓的标的被排除出 IC 样本。
+            而这些标的往往实现了较高收益，因此正因子的 IC均値可能被轻微低估。
+            如需全信号池 IC，应在调仓循环外对 df1 单独按月计算。
 
         参数:
-            trade2 (pd.DataFrame): 合并了未来真实收益的单期交易表。
+            trade2 (pd.DataFrame): 已合并未来真实收益的单期交易表。
             target_factor (str): 因子列名。
             ym (period): 当前月份。
 
         返回:
-            dict: 包含 ['year_month', 'ic', 'rank_ic'] 的字典。
+            dict | None: 包含 ['year_month', 'ic', 'rank_ic'] 的字典；样本数 <=10 时返回 None。
         """
         valid = trade2.dropna(subset=[target_factor, "actual_ret"]).copy()
         valid[target_factor] = pd.to_numeric(valid[target_factor], errors="coerce")
@@ -998,26 +1007,29 @@ class BacktestCoreMixin:
         best_g, worst_g = (max_group, 1) if direction == 1 else (1, max_group)
         return best_g, worst_g, direction
 
-    def _align_benchmark(self, df, df_bench_m):
+    def _align_benchmark(self, df):
         """
-        步骤8: 基准收益对齐与超额收益 (Alpha) 计算
+        收益对齐 (无基准模式)
 
-        计算逻辑:
-            Excess Return = Portfolio Return - Benchmark Return
-            Excess Cumulative = Π(1 + Excess Return)
+        说明:
+            基准指数已移除。bench_return 设为 0，下游结构完全兼容。
+
+            数学关系:
+                excess_ret = actual_ret - bench_return = actual_ret - 0 = actual_ret
+                excess_cum = Π(1 + excess_ret) = 等价于组合净值本身
+                win_rate   = P(actual_ret > 0) = 月度正收益胜率
 
         参数:
-            df (pd.DataFrame): 组合月度收益序列。
-            df_bench_m (pd.DataFrame): 基准指数月度收益序列。
+            df (pd.DataFrame): 组合月度收益序列，必须包含 'actual_ret' 和 '净值' 列。
 
         返回:
-            pd.DataFrame: 增加了超额收益列的序列。
+            pd.DataFrame: 增加 bench_return / excess_ret / excess_cum 列。
         """
-        df = pd.merge(df, df_bench_m, on="year_month", how="left").fillna(0)
+        df = df.copy()
         df["actual_ret"] = df["actual_ret"].astype(float)
         df["净值"] = df["净值"].astype(float)
-        df["bench_return"] = df["bench_return"].astype(float)
-        df["excess_ret"] = df["actual_ret"] - df["bench_return"]
+        df["bench_return"] = 0.0          # 无基准：以 0 作为参照收益
+        df["excess_ret"] = df["actual_ret"]
         df["excess_cum"] = (1 + df["excess_ret"]).cumprod()
         return df
 

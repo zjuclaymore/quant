@@ -122,9 +122,7 @@ def parse_args():
     parser.add_argument(
         "--end", type=str, default="2024-12", help="回测结束月份 (YYYY-MM), 默认2024-12, 2025年预留测试集"
     )
-    parser.add_argument(
-        "--benchmark", type=str, default="000905.SH", help="基准指数代码"
-    )
+    # --benchmark 已移除：不再加载外部基准指数
     parser.add_argument(
         "--disable-st-filter",
         action="store_true",
@@ -141,12 +139,7 @@ def parse_args():
         "--st-path", type=str, default=None, help="自定义 ST 数据目录或文件路径"
     )
     parser.add_argument("--commission", type=float, default=0.0, help="单边手续费率")
-    parser.add_argument(
-        "--group-size",
-        type=int,
-        default=0,
-        help="每组股票数量 (默认0表示十分位分组后每组全量参与回测, >0则按固定组大小分组)",
-    )
+    # --group-size 已硬编码为0（十分位分组），不再作为CLI参数
     parser.add_argument(
         "--top-n-per-group",
         type=int,
@@ -189,12 +182,7 @@ def parse_args():
         default=None,
         help="data_config.json 路径 (默认使用量化因子配置)",
     )
-    parser.add_argument(
-        "--rebalance-month-end-close",
-        action="store_true",
-        default=False,
-        help="强制使用月底收盘价进行买入和卖出调仓",
-    )
+    # --rebalance-month-end-close 已硬编码为 True（固定使用后复权收盘价调仓），不再作为CLI参数
     parser.add_argument(
         "--rebalance-month-start",
         action="store_true",
@@ -271,13 +259,7 @@ def main():
 
     print("[Phase 2b] 行业与市值已启用强制加载，不允许回退默认路径")
 
-    # --- Phase 2c: 指数数据目录 ---
-    index_daily_dir = data_paths.get(
-        "AIndexEODPrices",
-        os.path.join(project_root, "data", "中国A股指数日行情_AIndexEODPrices"),
-    )
-    if index_daily_dir is None or not os.path.isdir(index_daily_dir):
-        raise FileNotFoundError(f"[Phase 2c] 基准指数目录不存在或不可访问: {index_daily_dir}")
+    # Phase 2c: 基准指数已移除，不再加载指数日行情目录
 
     # 确定输出目录
     out_dir = os.path.join(project_root, "back_test", "sigle_factor_test", "output", factor_name)
@@ -289,7 +271,6 @@ def main():
         out_dir=out_dir,
         st_df=st_df,
         ind_df=ind_df,
-        index_daily_dir=index_daily_dir,
         delay_days=args.delay_days,
         rebalance_month_start=args.rebalance_month_start,
     )
@@ -301,12 +282,11 @@ def main():
         commission=args.commission,
         start_month=args.start,
         end_month=args.end,
-        benchmark_symbol=args.benchmark,
-        group_size=args.group_size,
+        group_size=0,                      # 固定十分位分组
         top_n_per_group=args.top_n_per_group,
         enable_neutralization=(not args.disable_neutralization),
         mad_clip_only=args.mad_clip_only,
-        rebalance_month_end_close=args.rebalance_month_end_close,
+        rebalance_month_end_close=True,    # 固定使用后复权收盘价调仓
     )
 
 
