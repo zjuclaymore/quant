@@ -18,6 +18,24 @@ try:
 except ImportError:
     from logger import get_logger
 
+try:
+    from back_test.path_utils import load_data_paths, get_path_from_config, get_project_root
+except ImportError:
+    # 兼容直接脚本运行场景
+    from pathlib import Path
+
+    def get_project_root():
+        return Path(__file__).resolve().parents[3]
+
+    def load_data_paths(config_path=None):
+        return {}
+
+    def get_path_from_config(paths, key, fallback_relative):
+        if key in paths and paths[key]:
+            p = Path(paths[key])
+            return str(p if p.is_absolute() else (get_project_root() / p).resolve())
+        return str((get_project_root() / fallback_relative).resolve())
+
 class MultiFactorDataLoader:
     """
     多因子数据加载器类
@@ -35,6 +53,7 @@ class MultiFactorDataLoader:
 
     def __init__(self, logger: logging.Logger = None):
         self.logger = logger or get_logger(__name__)
+        self.data_paths = load_data_paths()
 
     def _get_valid_factor_path(self, factor_group, factor_name, prefer_parquet=True):
         """
@@ -56,7 +75,8 @@ class MultiFactorDataLoader:
             如果未找到有效路径则返回 (None, None)
         """
         # 1. 优先尝试直接路径 (对应 factor_package 等扁平化存储)
-        direct_path = rf"E:\1_basement\quant_research\factor\{factor_group}\{factor_name}"
+        factor_root = get_path_from_config(self.data_paths, "factors.package", "factor")
+        direct_path = os.path.join(factor_root, factor_group, factor_name)
         if os.path.isdir(direct_path):
             pq_files = glob.glob(os.path.join(direct_path, "*.parquet"))
             if pq_files:
@@ -66,7 +86,7 @@ class MultiFactorDataLoader:
                 return direct_path, "csv"
 
         # 2. 尝试标准输出路径
-        base_path = rf"E:\1_basement\quant_research\factor\{factor_group}\{factor_name}\output"
+        base_path = os.path.join(factor_root, factor_group, factor_name, "output")
 
         if prefer_parquet:
             parquet_path = os.path.join(base_path, "class_by_date_parquet")
@@ -295,7 +315,11 @@ class MultiFactorDataLoader:
         Note:
             数据来源: E:\\1_basement\\quant_research\\data\\中国A股日行情_AShareEODPrices
         """
-        data_dir = r"E:\1_basement\quant_research\data\中国A股日行情_AShareEODPrices"
+        data_dir = get_path_from_config(
+            self.data_paths,
+            "AShareEODPrices",
+            "data/中国A股日行情_AShareEODPrices",
+        )
         files = sorted(glob.glob(os.path.join(data_dir, "*.pickle")))
 
         if start_date or end_date:
@@ -356,7 +380,11 @@ class MultiFactorDataLoader:
         If cal is provided: returns monthly returns.
         If cal is NOT provided: returns daily NAV series.
         """
-        idx_dir = r"E:\1_basement\quant_research\data\中国A股指数日行情_AIndexEODPrices"
+        idx_dir = get_path_from_config(
+            self.data_paths,
+            "AIndexEODPrices",
+            "data/中国A股指数日行情_AIndexEODPrices",
+        )
         self.logger.info(f"加载基准数据: {benchmark_symbol}")
         
         bench_prices = {}
@@ -433,7 +461,12 @@ class MultiFactorDataLoader:
         """
         加载股票上市日期数据
         """
-        ipo_path = r"E:\1_basement\quant_research\data\中国A股基本资料_AShareDescription\A股基本资料.pickle"
+        base_desc_dir = get_path_from_config(
+            self.data_paths,
+            "AShareDescription",
+            "data/中国A股基本资料_AShareDescription",
+        )
+        ipo_path = os.path.join(base_desc_dir, "A股基本资料.pickle")
         if os.path.exists(ipo_path):
             df_ipo = pd.read_pickle(ipo_path)
             # 找到上市公司代码列和上市日期列
@@ -474,7 +507,12 @@ class MultiFactorDataLoader:
         st_df, ind_df = None, None
         
         if load_st:
-            st_path = r"E:\1_basement\quant_research\data\中国A股特别处理_AShareST\ST.pickle"
+            st_base = get_path_from_config(
+                self.data_paths,
+                "AShareST",
+                "data/中国A股特别处理_AShareST",
+            )
+            st_path = os.path.join(st_base, "ST.pickle")
             if os.path.exists(st_path):
                 st_df = pd.read_pickle(st_path)
                 # 归一化列名 (避免重复映射)
@@ -496,7 +534,12 @@ class MultiFactorDataLoader:
                 self.logger.warning("未找到ST数据缓存文件")
                 
         if load_ind:
-            ind_path = r"E:\1_basement\quant_research\data\申万行业分类2021版_AShareSWNIndustriesClass\申万行业分类2021版.pickle"
+            ind_base = get_path_from_config(
+                self.data_paths,
+                "SWIndustryClass2021",
+                "data/申万行业分类2021版_AShareSWNIndustriesClass",
+            )
+            ind_path = os.path.join(ind_base, "申万行业分类2021版.pickle")
             if os.path.exists(ind_path):
                 ind_df = pd.read_pickle(ind_path)
                 self.logger.info(f"加载行业数据: {len(ind_df)}")
@@ -531,7 +574,8 @@ class MultiFactorDataLoader:
         Note:
             日历来源: E:\\1_basement\\quant_research\\data\\交易日历\\rebalance_calendar_cache.parquet
         """
-        cal_path = r"E:\1_basement\quant_research\data\交易日历\rebalance_calendar_cache.parquet"
+        cal_dir = get_path_from_config(self.data_paths, "TradeCalendar", "data/交易日历")
+        cal_path = os.path.join(cal_dir, "rebalance_calendar_cache.parquet")
         
         data_min = pd.to_datetime(df_daily["date"].min()) - pd.Timedelta(days=30)
         data_max = pd.to_datetime(df_daily["date"].max()) + pd.Timedelta(days=30)

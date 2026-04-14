@@ -916,53 +916,50 @@ def plot_coverage_and_exposure(
         )
         add_plot_to_html(html_parts, fig_dist, CHART_TITLE_1, chart_ctx=chart_ctx)
 
-    def _normalize_month_cov(df_cov):
+    def _prep_cov_df(df_cov):
+        """
+        标准化覆盖度 DataFrame，确保 year_month 为 PeriodIndex，
+        coverage/factor_count/market_count 为数值类型。
+
+        公式: coverage = factor_count / market_count（已在 bt_core 计算好）
+
+        参数:
+            df_cov (pd.DataFrame): 来自 bt_core._build_coverage_records 的原始覆盖度表。
+        返回:
+            pd.DataFrame | None: 标准化后的 DataFrame，字段含 year_month, coverage,
+                factor_count, market_count；或 None（输入无效时）。
+        """
         if df_cov is None or df_cov.empty or "year_month" not in df_cov.columns:
             return None
         cov = df_cov.copy()
         cov["year_month"] = pd.PeriodIndex(cov["year_month"].astype(str), freq="M")
+        # 保证 coverage 已计算
         if "coverage" not in cov.columns:
-            denom_col = None
-            for col in ["stock_pool_count", "candidate_count", "market_count"]:
-                if col in cov.columns:
-                    denom_col = col
-                    break
+            denom_col = next((c for c in ["market_count", "stock_pool_count", "candidate_count"] if c in cov.columns), None)
             if denom_col and "factor_count" in cov.columns:
                 cov["coverage"] = np.where(
                     pd.to_numeric(cov[denom_col], errors="coerce") > 0,
                     pd.to_numeric(cov["factor_count"], errors="coerce") / pd.to_numeric(cov[denom_col], errors="coerce"),
                     np.nan,
                 )
-        cov["coverage"] = pd.to_numeric(cov["coverage"], errors="coerce")
-        return cov[["year_month", "coverage"]]
+        for col in ["coverage", "factor_count", "market_count", "stock_pool_count"]:
+            if col in cov.columns:
+                cov[col] = pd.to_numeric(cov[col], errors="coerce")
+        return cov
 
-    def _normalize_cs_cov(df_cov):
-        if df_cov is None or df_cov.empty or "date" not in df_cov.columns:
-            return None
-        cov = df_cov.copy()
-        cov["date"] = pd.to_datetime(cov["date"], errors="coerce")
-        cov = cov.dropna(subset=["date"])
-        if "coverage" not in cov.columns:
-            denom_col = None
-            for col in ["stock_pool_count", "candidate_count", "market_count"]:
-                if col in cov.columns:
-                    denom_col = col
-                    break
-            if denom_col and "factor_count" in cov.columns:
-                cov["coverage"] = np.where(
-                    pd.to_numeric(cov[denom_col], errors="coerce") > 0,
-                    pd.to_numeric(cov["factor_count"], errors="coerce") / pd.to_numeric(cov[denom_col], errors="coerce"),
-                    np.nan,
-                )
-        cov["coverage"] = pd.to_numeric(cov["coverage"], errors="coerce")
-        return cov[["date", "coverage"]].sort_values("date")
+    def _plot_cov_rate(ax, cov_df, title, color, note):
+        """
+        绘制覆盖率百分比柱状图（左列）。
 
-    cov_all_month = _normalize_month_cov(df_coverage_all)
-    cov_trade_month = _normalize_month_cov(df_coverage_tradeable)
-    cov_all_cs = _normalize_cs_cov(df_coverage_all_cs)
-    cov_trade_cs = _normalize_cs_cov(df_coverage_tradeable_cs)
+        公式: coverage_rate = factor_count / denom_count（在 bt_core 预算好）
 
-    def _plot_cov_month(ax, cov_df, title, color, extra_text):
+        参数:
+            ax: matplotlib Axes 对象。
+            cov_df: 标准化覆盖度 DataFrame（含 year_month, coverage 列）。
+            title: 图标题。
+            color: 柱颜色（hex 字符串）。
+            note: 显示在图左上角的数据口径说明文字。
+        """
         ax.set_facecolor("#f5f5f5")
         if cov_df is None or cov_df.empty:
             ax.text(0.5, 0.5, "无覆盖度数据", ha="center", va="center", transform=ax.transAxes)
@@ -972,86 +969,111 @@ def plot_coverage_and_exposure(
         vals = cov_df["coverage"].fillna(0)
         ax.bar(ts, vals, color=color, width=25, alpha=0.82, zorder=3)
         avg_cov = vals.mean()
-        ax.axhline(avg_cov, color="#d97706", linewidth=1.0, linestyle="--", label=f"均值  {avg_cov*100:.1f}%", zorder=4)
-        _style_time_axis(ax, ts, ylabel="覆盖度", percent=True)
+        ax.axhline(avg_cov, color="#d97706", linewidth=1.0, linestyle="--",
+                   label=f"均值  {avg_cov*100:.1f}%", zorder=4)
+        _style_time_axis(ax, ts, ylabel="覆盖率", percent=True)
         ax.xaxis.grid(False)
         ax.set_ylim(0, 1.05)
         ax.set_title(title, loc="center")
         ax.text(
-            0.02,
-            0.95,
-            extra_text,
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=8.5,
-            color="#475569",
+            0.02, 0.95, note,
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.5, color="#475569",
             bbox=dict(boxstyle="round,pad=0.26", facecolor="white", edgecolor="#cbd5e1", alpha=0.95),
         )
         _style_legend(ax.legend(loc="lower right", framealpha=0.92))
 
-    def _plot_cov_cs(ax, cov_df, title, color, extra_text):
+    def _plot_cov_count(ax, cov_df, title, color_n, color_d, note, denom_label):
+        """
+        绘制绝对数量对比柱状图（右列）：因子覆盖数 vs 分母总数。
+
+        设计目的: 让用户同时看到覆盖率的分子和分母的量级，避免仅看比例时忽略
+        分母本身随时间的变化（如市场扩容）。
+
+        参数:
+            ax: matplotlib Axes 对象。
+            cov_df: 标准化覆盖度 DataFrame（含 year_month, factor_count, market_count/stock_pool_count 列）。
+            title: 图标题。
+            color_n: 分子（因子覆盖数）的柱颜色。
+            color_d: 分母（总数）的折线颜色。
+            note: 数据口径说明文字。
+            denom_label: 分母折线的图例标签（如"全 A 可交易总数"）。
+        """
         ax.set_facecolor("#f5f5f5")
         if cov_df is None or cov_df.empty:
             ax.text(0.5, 0.5, "无覆盖度数据", ha="center", va="center", transform=ax.transAxes)
             ax.set_title(title, loc="center")
             return
-        ts = cov_df["date"]
-        vals = cov_df["coverage"].fillna(0)
-        ax.plot(ts, vals, color=color, linewidth=1.0, alpha=0.9, label="截面覆盖度")
-        avg_cov = vals.mean()
-        ax.axhline(avg_cov, color="#d97706", linewidth=1.0, linestyle="--", label=f"均值  {avg_cov*100:.1f}%", zorder=4)
-        _style_time_axis(ax, ts, ylabel="覆盖度", percent=True)
+        ts = cov_df["year_month"].dt.to_timestamp()
+        # 分子：factor_count
+        fc = cov_df["factor_count"].fillna(0).astype(int)
+        # 分母：market_count 或 stock_pool_count
+        mc_col = "market_count" if "market_count" in cov_df.columns else "stock_pool_count"
+        mc = cov_df[mc_col].fillna(0).astype(int) if mc_col in cov_df.columns else pd.Series(0, index=cov_df.index)
+
+        ax.bar(ts, mc, color=color_d, width=25, alpha=0.35, zorder=2, label=denom_label)
+        ax.bar(ts, fc, color=color_n, width=25, alpha=0.85, zorder=3, label="因子覆盖数")
+        _style_time_axis(ax, ts, ylabel="股票数量（只）", percent=False)
         ax.xaxis.grid(False)
-        ax.set_ylim(0, 1.05)
         ax.set_title(title, loc="center")
         ax.text(
-            0.02,
-            0.95,
-            extra_text,
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=8.5,
-            color="#475569",
+            0.02, 0.95, note,
+            transform=ax.transAxes, ha="left", va="top", fontsize=8.5, color="#475569",
             bbox=dict(boxstyle="round,pad=0.26", facecolor="white", edgecolor="#cbd5e1", alpha=0.95),
         )
-        _style_legend(ax.legend(loc="lower right", framealpha=0.92))
+        _style_legend(ax.legend(loc="upper left", framealpha=0.92))
 
-    # 图2：覆盖度四子图（沿用“当前因子分布”的四维逻辑）
+    cov_all = _prep_cov_df(df_coverage_all)
+    cov_trade = _prep_cov_df(df_coverage_tradeable)
+
+    # 图2: 覆盖度四子图
+    # 布局:
+    #   [2.1 全市场覆盖率%]  | [2.2 全市场绝对数量: 因子覆盖 vs 全 A 可交易]
+    #   [2.3 股票池覆盖率%]  | [2.4 股票池绝对数量: 因子覆盖 vs 可交易池]
     fig_cov, axes_cov = plt.subplots(2, 2, figsize=(18, 10))
     fig_cov.subplots_adjust(top=0.88, left=0.05, right=0.98, bottom=0.18, wspace=0.22, hspace=0.34)
     _apply_report_caption(fig_cov, factor_name)
 
-    _plot_cov_month(
+    _plot_cov_rate(
         axes_cov[0, 0],
-        cov_all_month,
-        "2.1  月度全市场覆盖度",
+        cov_all,
+        "2.1  全市场覆盖率（因子库 / 全 A 可交易）",
         "#3b82f6",
-        "月度口径：N=月内 factor_count 累加，D=月内 market_count 累加，C=N/D。",
+        "分子=因子库有值标的数（未限流动性），分母=当期全 A 可交易池（剔除 BJ/ST/次新/停牌）。",
     )
-    _plot_cov_cs(
+    _plot_cov_count(
         axes_cov[0, 1],
-        cov_all_cs,
-        "2.2  交易截面全市场覆盖度",
-        "#06b6d4",
-        "日截面口径：N=factor_count，D=market_count，C=N/D。",
+        cov_all,
+        "2.2  全市场绝对数量（因子覆盖 vs 全 A 可交易）",
+        "#3b82f6",
+        "#94a3b8",
+        "蓝色柱=因子有值标的数；灰色背景=全 A 可交易总数（真实 A 股分母）。",
+        "全 A 可交易总数",
     )
-    _plot_cov_month(
+    _plot_cov_rate(
         axes_cov[1, 0],
-        cov_trade_month,
-        "2.3  月度股票池覆盖度",
+        cov_trade,
+        "2.3  股票池覆盖率（因子库 / 可交易池）",
         "#8b5cf6",
-        "股票池月度口径：N=月内 factor_count 累加，D=月内 market_count 累加。",
+        "分子=经流动性筛选后因子有值标的数，分母=同期可交易池（流动性口径一致）。",
     )
-    _plot_cov_cs(
+    _plot_cov_count(
         axes_cov[1, 1],
-        cov_trade_cs,
-        "2.4  交易截面股票池覆盖度",
-        "#f43f5e",
-        "股票池日截面口径：N=factor_count，D=market_count，C=N/D。",
+        cov_trade,
+        "2.4  股票池绝对数量（因子覆盖 vs 可交易池）",
+        "#8b5cf6",
+        "#c4b5fd",
+        "紫色柱=流动性筛选后因子有值数；浅紫背景=可交易池总数（同口径分母）。",
+        "可交易池总数",
+    )
+
+    fig_cov.text(
+        0.05, 0.04,
+        "说明: 左列为覆盖率（%），右列为绝对数量对比；"
+        "全市场口径（上行）分母为全 A 可交易总数，股票池口径（下行）分母为流动性筛选后的可交易池。",
+        fontsize=9, ha="left", va="bottom", color="#334155",
     )
     add_plot_to_html(html_parts, fig_cov, CHART_TITLE_1_COV, chart_ctx=chart_ctx)
+
 
 def plot_group_nav(grouped_returns, best_g, worst_g, html_parts, factor_name="", chart_ctx=None):
     if grouped_returns is None or grouped_returns.empty:

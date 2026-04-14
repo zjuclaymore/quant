@@ -18,12 +18,103 @@
 import os
 import glob
 import json
+import hashlib
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 
+try:
+    from back_test.path_utils import (
+        default_data_config_path,
+        load_data_paths,
+        get_path_from_config,
+    )
+except ImportError:
+    from pathlib import Path
 
-DEFAULT_DATA_CONFIG_PATH = r"E:\1_basement\quant_research\factor\factor_package\src\data_config.json"
+    def default_data_config_path():
+        return Path(__file__).resolve().parents[3] / "factor" / "factor_package" / "src" / "data_config.json"
+
+    def load_data_paths(config_path=None):
+        return {}
+
+    def get_path_from_config(paths, key, fallback_relative):
+        base = Path(__file__).resolve().parents[3]
+        if key in paths and paths[key]:
+            p = Path(paths[key])
+            return str(p if p.is_absolute() else (base / p).resolve())
+        return str((base / fallback_relative).resolve())
+
+
+DEFAULT_DATA_CONFIG_PATH = str(default_data_config_path())
+
+
+def _get_project_root():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _get_factor_cache_dir():
+    cache_dir = os.path.join(_get_project_root(), "mid_file", "factor_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return cache_dir
+
+
+def _build_source_signature(files, factor_dir, fmt):
+    parts = [os.path.abspath(factor_dir), fmt, str(len(files))]
+    for path in files:
+        try:
+            stat = os.stat(path)
+            parts.append(f"{os.path.basename(path)}|{stat.st_size}|{int(stat.st_mtime_ns)}")
+        except OSError:
+            parts.append(f"{os.path.basename(path)}|missing")
+    digest = hashlib.sha1("::".join(parts).encode("utf-8")).hexdigest()
+    return digest
+
+
+def _factor_cache_paths(cache_key):
+    cache_dir = _get_factor_cache_dir()
+    data_path = os.path.join(cache_dir, f"{cache_key}.parquet")
+    meta_path = os.path.join(cache_dir, f"{cache_key}.json")
+    return data_path, meta_path
+
+
+def _try_load_factor_cache(factor_dir, fmt, files):
+    cache_key = _build_source_signature(files, factor_dir, fmt)
+    cache_path, meta_path = _factor_cache_paths(cache_key)
+    if not (os.path.exists(cache_path) and os.path.exists(meta_path)):
+        return False, None, None, None, cache_path, meta_path
+
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("source_dir") != os.path.abspath(factor_dir):
+            return False, None, None, None, cache_path, meta_path
+        if meta.get("fmt") != fmt:
+            return False, None, None, None, cache_path, meta_path
+        if meta.get("cache_key") != cache_key:
+            return False, None, None, None, cache_path, meta_path
+
+        cached_df = pd.read_parquet(cache_path)
+        factor_col = meta.get("factor_col")
+        symbols_whitelist = set(cached_df["symbol"].astype(str).tolist()) if "symbol" in cached_df.columns else set()
+        return True, cached_df, factor_col, symbols_whitelist, cache_path, meta_path
+    except Exception as e:
+        print(f"[Error] 因子缓存读取失败({cache_path}): {type(e).__name__}: {e}")
+        return False, None, None, None, cache_path, meta_path
+
+
+def _write_factor_cache(cache_path, meta_path, df, factor_col, factor_dir, fmt, cache_key):
+    df.to_parquet(cache_path, index=False)
+    meta = {
+        "source_dir": os.path.abspath(factor_dir),
+        "fmt": fmt,
+        "cache_key": cache_key,
+        "factor_col": factor_col,
+        "row_count": int(len(df)),
+        "symbol_count": int(df["symbol"].nunique()) if "symbol" in df.columns else 0,
+    }
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 
 def load_data_config(config_path=None):
@@ -32,11 +123,13 @@ def load_data_config(config_path=None):
 
     参数:
         config_path (str, 可选): 配置文件路径。不传则使用默认路径。
+        当配置文件不存在时返回空字典，让调用的地方使用默认路径。
     """
     if config_path is None:
         config_path = DEFAULT_DATA_CONFIG_PATH
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"data_config.json not found: {config_path}")
+        print(f"[Info] data_config.json not found ({config_path}), 使用默认路径")
+        return {}
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -63,17 +156,18 @@ def get_valid_factor_path(factor_group, factor_name, prefer_parquet=False):
     异常:
         FileNotFoundError: 如果在所有预定义路径下均未找到数据。
     """
+    data_paths = load_data_paths()
+    factor_root = get_path_from_config(data_paths, "factor_root", "factor")
+
     # 优先支持直接路径 (Direct Path support for factor_package structure)
-    direct_path = rf"E:\1_basement\quant_research\factor\{factor_group}\{factor_name}"
+    direct_path = os.path.join(factor_root, factor_group, factor_name)
     if os.path.isdir(direct_path):
         import glob
         parquet_files = glob.glob(os.path.join(direct_path, "*.parquet"))
         if parquet_files:
             return direct_path, "parquet"
 
-    base_path = (
-        rf"E:\1_basement\quant_research\factor\{factor_group}\{factor_name}\output"
-    )
+    base_path = os.path.join(factor_root, factor_group, factor_name, "output")
 
     if prefer_parquet:
         parquet_path = os.path.join(base_path, "class_by_date_parquet")
@@ -132,10 +226,25 @@ def load_main_factor_data(factor_dir, fmt="csv"):
     返回:
         tuple: (full_factor_df, factor_col, symbols_whitelist)。
     """
-    if fmt == "parquet":
-        return load_factor_parquet(factor_dir)
+    source_files = sorted(glob.glob(os.path.join(factor_dir, "*.parquet" if fmt == "parquet" else "*.csv")))
+    if not source_files:
+        raise FileNotFoundError(f"未找到因子文件: {factor_dir}")
 
-    files = glob.glob(os.path.join(factor_dir, "*.csv"))
+    cache_hit, cached_df, cached_col, cached_whitelist, cache_path, meta_path = _try_load_factor_cache(
+        factor_dir, fmt, source_files
+    )
+    # if cache_hit:
+    #     print(f"[Phase 1] 因子缓存命中: {cache_path}")
+    #     return cached_df, cached_col, cached_whitelist
+
+    print(f"[Phase 1] 因子缓存未命中，开始重新加载并写入缓存: {cache_path}")
+
+    if fmt == "parquet":
+        full_factor_df, factor_col, symbols_whitelist = load_factor_parquet(factor_dir)
+        _write_factor_cache(cache_path, meta_path, full_factor_df, factor_col, factor_dir, fmt, _build_source_signature(source_files, factor_dir, fmt))
+        return full_factor_df, factor_col, symbols_whitelist
+
+    files = source_files
     factor_dfs = []
     symbols_whitelist = set()
     for f in tqdm(files, desc="[Phase 1] 加载因子数据"):
@@ -154,11 +263,12 @@ def load_main_factor_data(factor_dir, fmt="csv"):
             df["symbol"] = symbol
             symbols_whitelist.add(symbol)
             factor_dfs.append(df)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Error] 因子CSV加载失败({f}): {type(e).__name__}: {e}")
     full_factor_df = pd.concat(factor_dfs, ignore_index=True)
     potential_cols = [c for c in full_factor_df.columns if c not in ["date", "symbol"]]
     factor_col = potential_cols[0]
+    _write_factor_cache(cache_path, meta_path, full_factor_df, factor_col, factor_dir, fmt, _build_source_signature(source_files, factor_dir, fmt))
     return full_factor_df, factor_col, symbols_whitelist
 
 
@@ -209,8 +319,8 @@ def load_factor_parquet(factor_dir):
 
             symbols_whitelist.update(df["symbol"].tolist())
             all_dfs.append(df)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Error] 因子Parquet加载失败({f}): {type(e).__name__}: {e}")
 
     full_factor_df = pd.concat(all_dfs, ignore_index=True)
     print(
@@ -254,8 +364,8 @@ def load_aux_data(aux_dir, whitelist):
             df["date"] = pd.to_datetime(df["date"].astype(str))
             df["symbol"] = symbol
             aux_dfs.append(df)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Error] 辅助因子CSV加载失败({f}): {type(e).__name__}: {e}")
     return pd.concat(aux_dfs, ignore_index=True) if aux_dfs else None
 
 
@@ -274,8 +384,8 @@ def load_aux_parquet(aux_dir, whitelist):
             with open(meta_file, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             value_col = meta.get("factor_name") or meta.get("value_col")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Error] 辅助因子元数据读取失败({meta_file}): {type(e).__name__}: {e}")
 
     files = sorted(glob.glob(os.path.join(aux_dir, "*.parquet")))
     if not files:
@@ -320,8 +430,8 @@ def load_aux_parquet(aux_dir, whitelist):
                 df = df[["date", "symbol", value_col]]
 
             aux_dfs.append(df)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Error] 辅助因子Parquet加载失败({f}): {type(e).__name__}: {e}")
 
     return pd.concat(aux_dfs, ignore_index=True) if aux_dfs else None
 
@@ -391,8 +501,8 @@ def load_daily_prices_cross_section(data_dir, start_date=None, end_date=None):
             cols_exist = [c for c in keep_cols if c in df.columns]
             df = df[cols_exist]
             all_dfs.append(df)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Error] 日行情文件加载失败({f}): {type(e).__name__}: {e}")
 
     if not all_dfs:
         raise RuntimeError("未能加载任何日行情数据!")
@@ -421,7 +531,9 @@ def load_st_data(st_path=None):
         pd.DataFrame 或 None: 加载成功的状态表。
     """
     if st_path is None:
-        st_path = r"E:\1_basement\quant_research\data\中国A股特别处理_AShareST\ST.pickle"
+        data_paths = load_data_paths()
+        st_base = get_path_from_config(data_paths, "AShareST", "data/中国A股特别处理_AShareST")
+        st_path = os.path.join(st_base, "ST.pickle")
     else:
         if os.path.isdir(st_path):
             st_path = os.path.join(st_path, "ST.pickle")
@@ -445,7 +557,13 @@ def load_industry_data(ind_path=None):
         pd.DataFrame: 包含股票各时期行业分类映射的数据表。
     """
     if ind_path is None:
-        ind_path = r"E:\1_basement\quant_research\data\申万行业分类2021版_AShareSWNIndustriesClass\申万行业分类2021版.pickle"
+        data_paths = load_data_paths()
+        ind_base = get_path_from_config(
+            data_paths,
+            "SWIndustryClass2021",
+            "data/申万行业分类2021版_AShareSWNIndustriesClass",
+        )
+        ind_path = os.path.join(ind_base, "申万行业分类2021版.pickle")
     else:
         if os.path.isdir(ind_path):
             ind_path = os.path.join(ind_path, "申万行业分类2021版.pickle")
@@ -456,7 +574,7 @@ def load_industry_data(ind_path=None):
             print(f"[Warning] 加载行业分类数据失败: {e}")
     return None
 
-def load_calendar(df_daily, delay_days=0, logger=None):
+def load_calendar(df_daily, delay_days=0, rebalance_month_start=False, logger=None):
     """
     生成严格的调仓日历 (Rebalance Calendar Engine)
 
@@ -464,19 +582,24 @@ def load_calendar(df_daily, delay_days=0, logger=None):
 
     关键逻辑:
         1. 缓存依赖: 必须先运行 `generate_calendar_cache.py` 生成 Parquet 缓存，以保证回测的日期全局一致。
-        2. 信号延迟 (`delay_days`): 支持实战仿真的“发车延迟”。若 `delay_days > 0`，
-           所有的买入和卖出执行日将相对于标准计划日顺延对应个交易日。
-        3. 状态闭环: 确保回测区间完全被缓存覆盖，否则抛出异常。
+          2. 信号延迟 (`delay_days`): 支持实战仿真的“发车延迟”。若 `delay_days > 0`，
+              所有的买入和卖出执行日将相对于标准计划日顺延对应个交易日。
+          3. 月初调仓模式 (`rebalance_month_start`): 若开启，则当期信号对应“次月初买入、再下月初卖出”，
+              让卖旧与买新在月初同一调仓点发生。
+          4. 状态闭环: 确保回测区间完全被缓存覆盖，否则抛出异常。
 
     参数:
         df_daily (pd.DataFrame): 基础行情数据。
         delay_days (int): 交易延迟天数。
+        rebalance_month_start (bool): 是否采用月初调仓口径。
         logger (logging.Logger): 日志对象。
 
     返回:
         tuple: (调仓日历 DataFrame, 全量交易日序列)。
     """
-    calendar_cache_path = r"E:\1_basement\quant_research\data\交易日历\rebalance_calendar_cache.parquet"
+    data_paths = load_data_paths()
+    calendar_dir = get_path_from_config(data_paths, "TradeCalendar", "data/交易日历")
+    calendar_cache_path = os.path.join(calendar_dir, "rebalance_calendar_cache.parquet")
 
     data_min = pd.to_datetime(df_daily["date"].min()) - pd.Timedelta(days=30)
     data_max = pd.to_datetime(df_daily["date"].max()) + pd.Timedelta(days=30)
@@ -502,12 +625,19 @@ def load_calendar(df_daily, delay_days=0, logger=None):
 
             cal_list = []
             yms = sorted(cal_raw["ym"].unique())
-            for i in range(len(yms) - 1):
+            max_i = len(yms) - (2 if rebalance_month_start else 1)
+            if max_i <= 0:
+                raise ValueError("交易日历月份数量不足，无法构建调仓序列")
+
+            for i in range(max_i):
                 cur_ym = yms[i]
                 next_ym = yms[i + 1]
                 
                 base_buy = first_days[next_ym]
-                base_sell = last_days[next_ym]
+                if rebalance_month_start:
+                    base_sell = first_days[yms[i + 2]]
+                else:
+                    base_sell = last_days[next_ym]
                 
                 # Apply delay_days
                 buy_idx = trade_dates.get_loc(base_buy)
@@ -556,8 +686,10 @@ def load_benchmark_component(index_daily_dir, needed_dates, logger=None):
     """
     bench_prices = {}
     if index_daily_dir is None or not os.path.isdir(index_daily_dir):
-        if logger: logger.warning("未提供基准指数目录, 基准收益将为0")
-        return bench_prices
+        msg = f"未提供有效基准指数目录: {index_daily_dir}"
+        if logger:
+            logger.error(msg)
+        raise FileNotFoundError(msg)
 
     for d in sorted(needed_dates):
         date_str = d.strftime("%Y%m%d")

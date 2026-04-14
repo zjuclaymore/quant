@@ -209,12 +209,12 @@ def split_and_save(
     log.info(f"Saving {len(all_codes)} company files to {output_dir} ...")
     saved, skipped = 0, 0
     for code in tqdm(all_codes, desc="Saving"):
-        out_path = output_dir / f"{code}.parquet"
+        out_path = output_dir / f"{code}.pickle"
         if out_path.exists() and not overwrite:
             skipped += 1
             continue
         sub = merged[merged[CODE_COL] == code].reset_index(drop=True)
-        sub.to_parquet(out_path, index=False)
+        sub.to_pickle(out_path)
         saved += 1
 
     log.info(f"  saved: {saved}, skipped: {skipped}")
@@ -252,9 +252,9 @@ def main():
     split_and_save(merged, OUTPUT_DIR, args.codes, args.overwrite)
 
     log.info("All done.")
-    n_files = len(list(OUTPUT_DIR.glob("*.parquet")))
+    n_files = len(list(OUTPUT_DIR.glob("*.pickle")))
     print(f"\n✓ 输出目录: {OUTPUT_DIR}")
-    print(f"✓ 共 {n_files} 个公司 parquet 文件")
+    print(f"✓ 共 {n_files} 个公司 pickle 文件")
 
 
 if __name__ == "__main__":

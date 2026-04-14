@@ -44,7 +44,7 @@ class SingleFactorBacktesterV2(BacktestCoreMixin):
     """
 
     STOCK_POOL_CACHE_VERSION = "mid_file_v1"
-    NEW_STOCK_DAYS = 60
+    NEW_STOCK_DAYS = 120
 
     def __init__(
         self,

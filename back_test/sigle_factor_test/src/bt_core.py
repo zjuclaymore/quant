@@ -229,8 +229,26 @@ class BacktestCoreMixin:
         df1_all = df1.copy()
 
         # ============ 3.5 收集因子覆盖度信息 ============
-        # 覆盖度改为直接使用每期股票池追踪计数，避免用行情快照反推分母。
+        # 全市场覆盖度：分子=因子库在该月有值的标的数（df1_all），分母=market_total_count（全 A 可交易池真实总数）
+        # 股票池覆盖度：分子=经流动性筛选后有值的标的数（df1），分母=tradeable_count（同一流动性口径）
         def _build_coverage_records(frame, denom_col):
+            """
+            构建覆盖度记录表。
+
+            参数:
+                frame (pd.DataFrame): 因子截面数据（分子来源）。
+                denom_col (str): trace 表中作为分母的列名，应为
+                    'market_total_count'（全市场 A 股可交易总数，剔除 BJ/ST/次新/停牌）或
+                    'tradeable_count'（流动性筛选后的可交易池数）。
+
+            公式:
+                coverage = factor_count / denom_count
+                其中 factor_count = 该月份因子值非空的标的数量
+
+            返回:
+                pd.DataFrame: 包含 year_month, date, factor_count, market_count,
+                    stock_pool_count, coverage 的记录表。
+            """
             def _norm_ym(v):
                 try:
                     return pd.Period(str(v), freq="M").strftime("%Y-%m")
@@ -260,7 +278,11 @@ class BacktestCoreMixin:
                 pool_count = 0
                 if trace_lookup is not None and ym_key in trace_lookup.index:
                     try:
-                        pool_count = int(pd.to_numeric(trace_lookup.loc[ym_key, denom_col], errors="coerce"))
+                        raw_val = trace_lookup.loc[ym_key, denom_col]
+                        # loc 在 index 重复时返回 Series，取第一个值
+                        if isinstance(raw_val, pd.Series):
+                            raw_val = raw_val.iloc[0]
+                        pool_count = int(pd.to_numeric(raw_val, errors="coerce"))
                     except Exception:
                         pool_count = 0
                 coverage = factor_count / pool_count if pool_count > 0 else 0
@@ -276,11 +298,13 @@ class BacktestCoreMixin:
 
         df1 = self._apply_stock_pool_filter(df1, cal)
 
-        df_coverage_all = _build_coverage_records(df1_all, "candidate_count")
-        df_coverage_all_cs = df_coverage_all.copy()
+        # 全市场口径：分母 = market_total_count（当期买入日 stock_pool_df tradable_base=True 的全市场总数）
+        # 分子 = df1_all（未经流动性筛选，反映因子库自身能覆盖多少全 A 可交易股票）
+        df_coverage_all = _build_coverage_records(df1_all, "market_total_count")
 
+        # 股票池口径：分母 = tradeable_count（经流动性筛选后的可交易股票数）
+        # 分子 = df1（同流动性口径，反映因子在实际参与分组的股票中的覆盖率）
         df_coverage_tradeable = _build_coverage_records(df1, "tradeable_count")
-        df_coverage_tradeable_cs = df_coverage_tradeable.copy()
 
         # 便于核对图2(覆盖度)分子/分母
         try:
@@ -357,8 +381,8 @@ class BacktestCoreMixin:
             start_month, end_month, delay_days=0,
             df_coverage_all=df_coverage_all,
             df_coverage_tradeable=df_coverage_tradeable,
-            df_coverage_all_cs=df_coverage_all_cs,
-            df_coverage_tradeable_cs=df_coverage_tradeable_cs,
+            df_coverage_all_cs=None,
+            df_coverage_tradeable_cs=None,
             df1_all=df1_all,
             source_factor_col=source_factor_col,
         )
@@ -485,11 +509,6 @@ class BacktestCoreMixin:
             return set()
 
         liq_snap = liq_snap[liq_snap["valid_days_20"] >= 15]
-        if liq_snap.empty:
-            return set()
-
-        vol_threshold = liq_snap["avg_vol_20"].quantile(0.10)
-        liq_snap = liq_snap[liq_snap["avg_vol_20"] >= vol_threshold]
         return set(liq_snap["symbol"].astype(str).tolist())
 
     def _apply_stock_pool_filter(self, df1, cal):
@@ -502,6 +521,12 @@ class BacktestCoreMixin:
             1. 流动性验证: 查询预定义的 `self.liq_df`。要求过去 20 个交易日中至少有 15 天有成交量，
                且当前截面的平均成交量不能处于全市场的末尾 10% (剔除僵尸股)。
             2. 信号连贯性: 确保信号日期与调仓日历匹配。
+
+        追踪字段说明:
+            - candidate_count   : 因子库中在该月包含有效记录的标的数（非全市场）。
+            - tradeable_count   : 经流动性筛选后，实际可参与分组的标的数。
+            - market_total_count: 当期买入日全市场满足 tradable_base=True 的标的总数（真实 A 股可交易池大小），
+                                  用作"全市场覆盖度"图表的分母，与 candidate_count 语义不同。
 
         参数:
             df1 (pd.DataFrame): 已完成预处理的备选池数据。
@@ -519,6 +544,15 @@ class BacktestCoreMixin:
             signal_df = df1[df1["year_month"] == ym].copy()
             candidate_count = int(len(signal_df))
 
+            # --- 全市场可交易总数（真正的 A 股分母，排除 BJ/次新/ST/停牌）---
+            market_total_count = 0
+            if hasattr(self, "stock_pool_df") and self.stock_pool_df is not None:
+                day_pool = self.stock_pool_df[
+                    (self.stock_pool_df["date"] == t_buy)
+                    & (self.stock_pool_df["tradable_base"] == True)
+                ]
+                market_total_count = int(len(day_pool))
+
             # --- 流动性提前筛选 ---
             valid_liq = self._get_strict_liq_symbols(t_buy)
             if valid_liq:
@@ -533,6 +567,7 @@ class BacktestCoreMixin:
                     "date": t_buy,
                     "candidate_count": candidate_count,
                     "tradeable_count": tradeable_count,
+                    "market_total_count": market_total_count,
                 }
             )
 
@@ -912,6 +947,26 @@ class BacktestCoreMixin:
                 if df_ic is not None and not df_ic.empty
                 else pd.DataFrame(columns=["year_month", "ic", "rank_ic"])
             )
+
+            ic_mean = total_df["ic"].astype(float).mean() if "ic" in total_df.columns and not total_df.empty else float("nan")
+            ic_std = total_df["ic"].astype(float).std() if "ic" in total_df.columns and not total_df.empty else float("nan")
+            ric_mean = total_df["rank_ic"].astype(float).mean() if "rank_ic" in total_df.columns and not total_df.empty else float("nan")
+            ric_std = total_df["rank_ic"].astype(float).std() if "rank_ic" in total_df.columns and not total_df.empty else float("nan")
+
+            ic_ir = ic_mean / ic_std if ic_std and not np.isnan(ic_std) else float("nan")
+            ric_ir = ric_mean / ric_std if ric_std and not np.isnan(ric_std) else float("nan")
+            ic_ir_ann = ic_ir * np.sqrt(12) if not np.isnan(ic_ir) else float("nan")
+            ric_ir_ann = ric_ir * np.sqrt(12) if not np.isnan(ric_ir) else float("nan")
+
+            total_df["ic_mean"] = ic_mean
+            total_df["ic_std"] = ic_std
+            total_df["ic_ir"] = ic_ir
+            total_df["annualized_ic_ir"] = ic_ir_ann
+            total_df["rank_ic_mean"] = ric_mean
+            total_df["rank_ic_std"] = ric_std
+            total_df["rank_ic_ir"] = ric_ir
+            total_df["annualized_rank_ic_ir"] = ric_ir_ann
+
             total_df.to_csv(total_out, index=False, encoding="utf-8-sig")
 
             self.logger.info("IC序列已导出: %s", total_out)
