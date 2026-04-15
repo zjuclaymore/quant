@@ -1,0 +1,10 @@
+﻿paper_rows 602686
+paper_has_required_cols True
+paper_bad_buy_date 0
+paper_dup_buy_code 0
+buy_dates_n 237
+pool_rows_on_buy_dates 639525
+pool_unique_date_code 639525
+paper_key_not_found_in_pool 0
+theoretical_can_buy_rows 585190
+theoretical_can_buy_ratio 0.970970
